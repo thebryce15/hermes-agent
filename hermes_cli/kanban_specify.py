@@ -152,6 +152,10 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
+    return SpecifyOutcome(
+        task_id, False,
+        "specify refused: triage promotion is not an admitted writer operation",
+    )
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
@@ -254,6 +258,9 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
     """
+    raise RuntimeError(
+        "triage listing refused: use the admitted writer list operation"
+    )
     with kb.connect_closing() as conn:
         tasks = kb.list_tasks(
             conn,

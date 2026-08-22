@@ -19,12 +19,14 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
 import shlex
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -41,6 +43,12 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_cli.kanban_writer import (
+    CANONICAL_SOCKET_PATH,
+    FORBIDDEN_FIELDS,
+    WriterError,
+    writer_request,
+)
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -54,6 +62,98 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+
+_KANBAN_CANONICAL_BOARD = "bryceos"
+_KANBAN_REQUEST_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+def _d0b_refuse_slash(command: str) -> str:
+    """Fail closed before a mutating slash command reaches a side effect."""
+    return f"/{command} refused by D0B admission boundary"
+
+
+def _kanban_writer_socket() -> Path:
+    return CANONICAL_SOCKET_PATH
+
+
+def _kanban_writer_call(
+    operation: str,
+    args: Optional[dict[str, Any]] = None,
+    *,
+    mutation: bool = False,
+    request_key: Optional[str] = None,
+) -> Any:
+    """Call only the fixed writer socket; never fall back to the CLI/DB."""
+    if mutation and (
+        not isinstance(request_key, str)
+        or not _KANBAN_REQUEST_KEY_RE.fullmatch(request_key)
+    ):
+        raise ValueError(f"{operation}: stable request_key is required before writer IPC")
+    try:
+        response = writer_request(
+            _kanban_writer_socket(),
+            operation,
+            args or {},
+            request_key=request_key if mutation else None,
+        )
+    except (OSError, WriterError) as exc:
+        raise RuntimeError(f"kanban writer unavailable: {exc}") from exc
+    return response.get("result") if isinstance(response, dict) else response
+
+
+def _kanban_json(value: Any) -> str:
+    """Keep slash replies readable while retaining all writer fields."""
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _kanban_source_subscription(event: MessageEvent) -> Optional[dict[str, str]]:
+    source = getattr(event, "source", None)
+    platform = getattr(source, "platform", None)
+    platform_value = getattr(platform, "value", platform)
+    platform_str = str(platform_value or "").lower()
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    if not platform_str or not chat_id:
+        return None
+    return {
+        "platform": platform_str,
+        "chat_id": chat_id,
+        "chat_type": str(getattr(source, "chat_type", "") or ""),
+        "thread_id": str(getattr(source, "thread_id", "") or ""),
+    }
+
+
+def _kanban_event_request_key(
+    event: MessageEvent,
+    operation: str,
+    *,
+    purpose: str = "",
+) -> str:
+    """Derive a retry-stable key from the gateway's existing message identity."""
+    source = getattr(event, "source", None)
+    message_id = str(getattr(event, "message_id", "") or "")
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    platform = str(platform or getattr(source, "platform", "") or "").lower()
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    if not message_id or not platform or not chat_id:
+        raise ValueError(
+            f"{operation}: stable message identity is required before writer IPC"
+        )
+    material = json.dumps(
+        {
+            "operation": operation,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": str(getattr(source, "thread_id", "") or ""),
+            "message_id": message_id,
+            "purpose": purpose,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"slash-{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
 
 
 def _clean_str(value: Any) -> str:
@@ -430,112 +530,249 @@ class GatewaySlashCommandsMixin:
         )
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
-        """Handle /kanban — delegate to the shared kanban CLI.
+        """Handle the finite D0B Kanban command set through writer IPC."""
+        text = (event.text or "").strip().lstrip("/")
+        if text.lower().startswith("kanban"):
+            text = text[6:].lstrip()
+        try:
+            tokens = shlex.split(text) if text else []
+        except ValueError as exc:
+            return f"Kanban command refused: {exc}"
+        if not tokens:
+            return "Kanban command refused: an operation is required"
 
-        Run the potentially-blocking DB work in a thread pool so the
-        gateway event loop stays responsive.  Read operations (list,
-        show, context, tail) are permitted while an agent is running;
-        mutations are allowed too because the board is profile-agnostic
-        and does not touch the running agent's state.
-
-        For ``/kanban create`` invocations we also auto-subscribe the
-        originating gateway source (platform + chat + thread) to the new
-        task's terminal events, so the user hears back when the worker
-        completes / blocks / auto-blocks / crashes without having to poll.
-        """
-        import asyncio
-        import re
-        import shlex
-        from hermes_cli.kanban import run_slash
-
-        text = (event.text or "").strip()
-        # Strip the leading "/kanban" (with or without slash), leaving args.
-        if text.startswith("/"):
-            text = text.lstrip("/")
-        if text.startswith("kanban"):
-            text = text[len("kanban"):].lstrip()
-
-        tokens = shlex.split(text) if text else []
-        requested_board = None
-        action = None
+        # Board selection is accepted only as the frozen canonical slug and is
+        # never forwarded to the writer.
+        filtered: list[str] = []
+        requested_board: Optional[str] = None
         i = 0
         while i < len(tokens):
-            tok = tokens[i]
-            if tok == "--board":
+            token = tokens[i]
+            folded_token = token.casefold()
+            if folded_token == "--board":
                 if i + 1 >= len(tokens):
-                    break
+                    return "Kanban command refused: --board needs a value"
                 requested_board = tokens[i + 1]
                 i += 2
                 continue
-            if tok.startswith("--board="):
-                requested_board = tok.split("=", 1)[1]
+            if folded_token.startswith("--board="):
+                requested_board = token.split("=", 1)[1]
                 i += 1
                 continue
-            action = tok
-            break
+            filtered.append(token)
+            i += 1
+        if requested_board not in (None, "", _KANBAN_CANONICAL_BOARD):
+            return "Kanban command refused: only the canonical bryceos board is admitted"
+        if not filtered:
+            return "Kanban command refused: an operation is required"
 
-        is_create = action == "create"
+        action = filtered.pop(0).lower().replace("-", "_")
+        if action in {"attach", "delete", "remove", "dispatch", "decompose", "reclaim", "reassign", "specify", "estimate", "board", "boards", "project", "projects", "update", "bulk"}:
+            return f"Kanban command refused: {action} is outside the writer admission boundary"
+
+        def parse_options(values: list[str]) -> tuple[list[str], dict[str, str]]:
+            positional: list[str] = []
+            options: dict[str, str] = {}
+            j = 0
+            while j < len(values):
+                value = values[j]
+                if not value.startswith("--"):
+                    positional.append(value)
+                    j += 1
+                    continue
+                key_value = value[2:].split("=", 1)
+                key = key_value[0].casefold().replace("-", "_")
+                if len(key_value) == 2:
+                    options[key] = key_value[1]
+                elif j + 1 < len(values) and not values[j + 1].startswith("--"):
+                    options[key] = values[j + 1]
+                    j += 1
+                else:
+                    options[key] = "true"
+                j += 1
+            return positional, options
+
+        positional, options = parse_options(filtered)
+        forbidden = {
+            str(field).casefold().replace("-", "_") for field in FORBIDDEN_FIELDS
+        } | {"path"}
+        if forbidden.intersection(options):
+            return "Kanban command refused: identity, store, SQL, and path fields are writer-owned"
+
+        allowed_options = {
+            "show": set(),
+            "list": {"assignee", "status", "tenant", "include_archived", "limit", "order_by", "workflow_template_id", "current_step_key"},
+            "runs": {"include_active", "state_type", "state_name"},
+            "events": set(),
+            "comments": set(),
+            "attachments": set(),
+            "create": {"title", "body", "assignee", "tenant", "priority", "parents"},
+            "link": set(),
+            "unlink": set(),
+            "comment": {"body"},
+            "block": {"reason", "kind", "expected_run_id"},
+            "unblock": set(),
+            "assign": {"assignee"},
+            "claim": {"ttl_seconds"},
+            "heartbeat": {"ttl_seconds"},
+            "complete": {"result", "summary", "expected_run_id"},
+            "notify_read": {"kinds"},
+            "notify_subscribe": set(),
+            "notify_unsubscribe": set(),
+            "notify_claim": {"kinds"},
+            "notify_advance": {"new_cursor"},
+            "notify_rewind": {"claimed_cursor", "old_cursor"},
+        }
+        unknown_options = sorted(set(options) - allowed_options.get(action, set()))
+        if unknown_options:
+            return (
+                "Kanban command refused: unsupported option(s): "
+                + ", ".join(f"--{name.replace('_', '-')}" for name in unknown_options)
+            )
+
+        def need(index: int, name: str = "task_id") -> str:
+            if index >= len(positional) or not positional[index]:
+                raise ValueError(f"{name} is required")
+            return positional[index]
+
+        def option_bool(name: str) -> bool:
+            raw = options[name].strip().lower()
+            if raw in {"1", "true", "yes", "on"}:
+                return True
+            if raw in {"0", "false", "no", "off"}:
+                return False
+            raise ValueError(f"{name} must be boolean")
+
+        operation: Optional[str] = None
+        args: dict[str, Any] = {}
+        mutation = action not in {"show", "list", "runs", "events", "comments", "attachments", "notify_read"}
 
         try:
-            output = await asyncio.to_thread(run_slash, text)
-        except Exception as exc:  # pragma: no cover - defensive
-            return t("gateway.kanban.error_prefix", error=exc)
+            if action == "show":
+                operation, args = "show", {"task_id": need(0)}
+            elif action == "list":
+                operation = "list"
+                allowed = {"assignee", "status", "tenant", "include_archived", "limit", "order_by", "workflow_template_id", "current_step_key"}
+                args = {key: value for key, value in options.items() if key in allowed}
+                if "include_archived" in args:
+                    args["include_archived"] = option_bool("include_archived")
+                if "limit" in args:
+                    args["limit"] = int(args["limit"])
+                if positional:
+                    raise ValueError("list accepts filters, not positional values")
+            elif action in {"runs", "events", "comments", "attachments"}:
+                operation, args = action, {"task_id": need(0)}
+                if action == "runs":
+                    if "include_active" in options:
+                        args["include_active"] = option_bool("include_active")
+                    if "state_type" in options:
+                        args["state_type"] = options["state_type"]
+                        args["state_name"] = options.get("state_name", "")
+            elif action == "create":
+                operation = "create"
+                title = options.get("title") or (" ".join(positional) if positional else "")
+                if not title:
+                    raise ValueError("title is required")
+                args = {"title": title}
+                for key in ("body", "assignee", "tenant"):
+                    if key in options:
+                        args[key] = options[key]
+                if "priority" in options:
+                    args["priority"] = int(options["priority"])
+                if "parents" in options:
+                    args["parents"] = [part for part in options["parents"].split(",") if part]
+            elif action in {"link", "unlink"}:
+                operation = action
+                args = {"parent_id": need(0, "parent_id"), "child_id": need(1, "child_id")}
+            elif action == "comment":
+                operation, args = "comment", {"task_id": need(0), "body": options.get("body") or " ".join(positional[1:])}
+                if not args["body"]:
+                    raise ValueError("comment body is required")
+            elif action == "block":
+                operation, args = "block", {"task_id": need(0), "reason": options.get("reason") or " ".join(positional[1:])}
+                if not args["reason"]:
+                    raise ValueError("block reason is required")
+                for key in ("kind", "expected_run_id"):
+                    if key in options:
+                        args[key] = options[key]
+            elif action in {"unblock", "assign", "claim", "heartbeat", "complete"}:
+                operation, args = action, {"task_id": need(0)}
+                if action == "assign":
+                    args["assignee"] = options.get("assignee") or need(1, "assignee")
+                elif action in {"claim", "heartbeat"}:
+                    if "ttl_seconds" in options:
+                        args["ttl_seconds"] = int(options["ttl_seconds"])
+                else:
+                    for key in ("result", "summary", "expected_run_id"):
+                        if key in options:
+                            args[key] = options[key]
+            elif action.startswith("notify_"):
+                operation = action.replace("_", "-")
+                if operation not in {"notify-read", "notify-subscribe", "notify-unsubscribe", "notify-claim", "notify-advance", "notify-rewind"}:
+                    raise ValueError(f"unsupported notification operation: {action}")
+                source_args = _kanban_source_subscription(event)
+                if source_args is None:
+                    raise ValueError("the gateway source has no platform/chat target")
+                # The closed writer schemas admit ``chat_type`` only for the
+                # subscribe operation.  Reusing the full source mapping for
+                # read/claim/cursor routes would be rejected before dispatch.
+                args = {
+                    "task_id": need(0),
+                    "platform": source_args["platform"],
+                    "chat_id": source_args["chat_id"],
+                    "thread_id": source_args["thread_id"],
+                }
+                if operation == "notify-subscribe" and source_args["chat_type"]:
+                    args["chat_type"] = source_args["chat_type"]
+                if operation in {"notify-read", "notify-claim"} and "kinds" in options:
+                    args["kinds"] = [part for part in options["kinds"].split(",") if part]
+                if operation == "notify-advance":
+                    args["new_cursor"] = int(options.get("new_cursor") or need(1, "new_cursor"))
+                if operation == "notify-rewind":
+                    args["claimed_cursor"] = int(options.get("claimed_cursor") or need(1, "claimed_cursor"))
+                    args["old_cursor"] = int(options.get("old_cursor") or need(2, "old_cursor"))
+            else:
+                return f"Kanban command refused: {action} is outside the writer admission boundary"
 
-        # Auto-subscribe on create. Parse the task id from the CLI's standard
-        # success line ("Created t_abcd  (ready, assignee=...)"). If the user
-        # passed --json we don't subscribe; they're clearly scripting and
-        # can call /kanban notify-subscribe explicitly.
-        if is_create and output:
-            m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
-            if m:
-                task_id = m.group(1)
-                try:
-                    source = event.source
-                    platform = getattr(source, "platform", None)
-                    platform_str = (
-                        platform.value if hasattr(platform, "value") else str(platform or "")
-                    ).lower()
-                    chat_id = str(getattr(source, "chat_id", "") or "")
-                    chat_type = str(getattr(source, "chat_type", "") or "") or None
-                    thread_id = str(getattr(source, "thread_id", "") or "")
-                    user_id = str(getattr(source, "user_id", "") or "") or None
-                    delivery_metadata = self._thread_metadata_for_source(
-                        source, self._reply_anchor_for_event(event)
-                    ) or None
-                    if isinstance(delivery_metadata, dict):
-                        chat_type = str(getattr(source, "chat_type", "") or "")
-                        if chat_type:
-                            delivery_metadata.setdefault("chat_type", chat_type)
-                    if platform_str and chat_id:
-                        def _sub():
-                            from hermes_cli import kanban_db as _kb
-                            conn = _kb.connect(board=requested_board)
-                            try:
-                                _kb.add_notify_sub(
-                                    conn, task_id=task_id,
-                                    platform=platform_str, chat_id=chat_id,
-                                    chat_type=chat_type,
-                                    thread_id=thread_id or None,
-                                    user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                                    delivery_metadata=delivery_metadata,
-                                )
-                            finally:
-                                conn.close()
-                        await asyncio.to_thread(_sub)
-                        output = (
-                            output.rstrip()
-                            + "\n"
-                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
-                        )
-                except Exception as exc:
-                    logger.warning("kanban create auto-subscribe failed: %s", exc)
+            result = await asyncio.to_thread(
+                _kanban_writer_call,
+                operation,
+                args,
+                mutation=mutation,
+                request_key=(
+                    _kanban_event_request_key(event, operation)
+                    if mutation else None
+                ),
+            )
+            if action == "create" and isinstance(result, dict) and result.get("task_id"):
+                source_args = _kanban_source_subscription(event)
+                if source_args is not None:
+                    subscribe_args = {
+                        "task_id": str(result["task_id"]),
+                        "platform": source_args["platform"],
+                        "chat_id": source_args["chat_id"],
+                        "thread_id": source_args["thread_id"],
+                    }
+                    if source_args["chat_type"]:
+                        subscribe_args["chat_type"] = source_args["chat_type"]
+                    await asyncio.to_thread(
+                        _kanban_writer_call,
+                        "notify-subscribe",
+                        subscribe_args,
+                        mutation=True,
+                        request_key=_kanban_event_request_key(
+                            event,
+                            "notify-subscribe",
+                            purpose=str(result["task_id"]),
+                        ),
+                    )
+            output = _kanban_json(result)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            output = f"Kanban command refused: {exc}"
 
-        # Gateway messages have practical length caps; truncate long
-        # listings to keep the UX reasonable.
         if len(output) > 3800:
-            output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
-        return output or t("gateway.kanban.no_output")
+            output = output[:3800] + "\n…"
+        return output or "Kanban writer returned no result"
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
@@ -1523,6 +1760,7 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""
+        return _d0b_refuse_slash("restart")
         from gateway.run import _hermes_home
         # Defensive idempotency check: if the previous gateway process
         # recorded this same /restart (same platform + update_id) and the new
@@ -1680,6 +1918,8 @@ class GatewaySlashCommandsMixin:
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
+        if event.get_command_args().strip() not in {"", "--list"}:
+            return _d0b_refuse_slash("model")
         from gateway.run import _hermes_home, _load_gateway_config
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_switch_args,
@@ -2561,6 +2801,7 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
+        return _d0b_refuse_slash("retry")
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -2613,6 +2854,8 @@ class GatewaySlashCommandsMixin:
         """
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
+        if args and lower not in {"status", "list"}:
+            return _d0b_refuse_slash("goal")
 
         mgr, session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
@@ -2748,6 +2991,8 @@ class GatewaySlashCommandsMixin:
         to invoke while the agent is running.
         """
         args = (event.get_command_args() or "").strip()
+        if args and args.lower() not in {"status", "list"}:
+            return _d0b_refuse_slash("subgoal")
         mgr, _session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
@@ -2802,6 +3047,7 @@ class GatewaySlashCommandsMixin:
         (active-only) transcript — the gateway's equivalent of the CLI's
         in-place history surgery + memory-cache invalidation.
         """
+        return _d0b_refuse_slash("undo")
         source = event.source
 
         # Parse optional turn count: "/undo" → 1, "/undo 3" → 3.
@@ -2842,6 +3088,7 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
+        return _d0b_refuse_slash("sethome")
         from gateway.run import _home_target_env_var, _home_thread_env_var
         source = event.source
         platform_name = source.platform.value if source.platform else "unknown"
@@ -3157,6 +3404,7 @@ class GatewaySlashCommandsMixin:
         When it completes, sends the result back to the same chat without
         modifying the active session's conversation history.
         """
+        return _d0b_refuse_slash("background")
         prompt = event.get_command_args().strip()
         if not prompt:
             return t("gateway.background.usage")
@@ -3434,6 +3682,9 @@ class GatewaySlashCommandsMixin:
         Gate changes persist to config.yaml and evict the cached agent so the
         new setting takes effect on the next message.
         """
+        _memory_args = event.get_command_args().strip().split()
+        if _memory_args and _memory_args[0].lower() not in {"pending"}:
+            return _d0b_refuse_slash("memory")
         from gateway.run import _hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
@@ -3483,6 +3734,9 @@ class GatewaySlashCommandsMixin:
         the write-approval ``diff <id>``; the CLI also has an unrelated
         ``hermes skills diff <name>`` that diffs a bundled skill vs stock.)
         """
+        _skills_args = event.get_command_args().strip().split()
+        if _skills_args and _skills_args[0].lower() not in {"pending", "diff"}:
+            return _d0b_refuse_slash("skills")
         from gateway.run import _hermes_home
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
@@ -4337,6 +4591,9 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
+        raw_args = event.get_command_args().strip()
+        if raw_args and not all(part in {"--all", "--cross-room"} for part in raw_args.split()):
+            return _d0b_refuse_slash("resume")
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
@@ -5391,6 +5648,8 @@ class GatewaySlashCommandsMixin:
         files are written so either the current gateway process or the next one
         can notify the user when the update finishes.
         """
+        return _d0b_refuse_slash("update")
+
         from gateway.run import _hermes_home, _resolve_hermes_bin
         import json
         import shutil

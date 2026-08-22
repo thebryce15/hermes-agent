@@ -26,6 +26,13 @@ from hermes_constants import get_default_hermes_root, get_hermes_home, display_h
 logger = logging.getLogger(__name__)
 
 
+def _refuse_unadmitted(action: str) -> None:
+    raise RuntimeError(
+        f"{action} refused: backup/import filesystem and database routes "
+        "are not admitted by the privileged writer"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Exclusion rules
 # ---------------------------------------------------------------------------
@@ -503,6 +510,7 @@ def _format_size(nbytes: int) -> str:
 
 def run_backup(args) -> None:
     """Create a zip backup of the Hermes home directory."""
+    _refuse_unadmitted("backup")
     hermes_root = get_default_hermes_root()
 
     if not hermes_root.is_dir():
@@ -737,6 +745,7 @@ def _detect_prefix(zf: zipfile.ZipFile) -> str:
 
 def run_import(args) -> None:
     """Restore a Hermes backup from a zip file."""
+    _refuse_unadmitted("import")
     zip_path = Path(args.zipfile).expanduser().resolve()
 
     if not zip_path.is_file():
@@ -1032,6 +1041,7 @@ def create_quick_snapshot(
     Returns:
         Snapshot ID (timestamp-based), or None if no files found.
     """
+    _refuse_unadmitted("snapshot")
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
 
@@ -1225,6 +1235,7 @@ def list_quick_snapshots(
     hermes_home: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """List existing quick state snapshots, most recent first."""
+    _refuse_unadmitted("snapshot list")
     root = _quick_snapshot_root(hermes_home)
     if not root.exists():
         return []
@@ -1255,6 +1266,7 @@ def restore_quick_snapshot(
     Overwrites current state files with the snapshot's copies.
     Returns True if at least one file was restored.
     """
+    _refuse_unadmitted("snapshot restore")
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
 
@@ -1461,11 +1473,13 @@ def prune_quick_snapshots(
     hermes_home: Optional[Path] = None,
 ) -> int:
     """Manually prune quick snapshots. Returns count deleted."""
+    _refuse_unadmitted("snapshot prune")
     return _prune_quick_snapshots(_quick_snapshot_root(hermes_home), keep=keep)
 
 
 def run_quick_backup(args) -> None:
     """CLI entry point for hermes backup --quick."""
+    _refuse_unadmitted("quick backup")
     label = getattr(args, "label", None)
     snap_id = create_quick_snapshot(label=label)
     if snap_id:
@@ -1627,6 +1641,7 @@ def create_pre_update_backup(
     found or the backup could not be created.  Never raises — the caller
     (``hermes update``) should continue even if the backup fails.
     """
+    _refuse_unadmitted("pre-update backup")
     hermes_root = hermes_home or get_default_hermes_root()
     if not hermes_root.is_dir():
         return None
@@ -1702,6 +1717,7 @@ def create_pre_migration_backup(
     to back up (fresh install) or the write failed.  Never raises — the
     caller decides whether to abort or proceed.
     """
+    _refuse_unadmitted("pre-migration backup")
     hermes_root = hermes_home or get_default_hermes_root()
     if not hermes_root.is_dir():
         return None

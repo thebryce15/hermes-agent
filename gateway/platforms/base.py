@@ -26,6 +26,11 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+
+def _d0b_refuse_platform_sink(name: str) -> None:
+    """Fail closed for platform/cache sinks until an admitted writer exists."""
+    raise RuntimeError(f"platform sink refused by D0B admission boundary: {name}")
+
 # Audio file extensions Hermes recognizes for native audio delivery.
 # Keep Telegram's narrower attachment/voice sets below separate: formats such
 # as MPEG-2 Layer II are audio to Hermes but unsupported by sendAudio/sendVoice.
@@ -800,6 +805,7 @@ async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
 
 def get_image_cache_dir() -> Path:
     """Return the image cache directory, creating it if it doesn't exist."""
+    _d0b_refuse_platform_sink("image cache directory")
     d = _resolve_cache_dir("IMAGE_CACHE_DIR", "cache/images", "image_cache")
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -837,6 +843,7 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
         ValueError: If *data* does not look like a valid image (e.g. an HTML
             error page returned by the upstream server).
     """
+    _d0b_refuse_platform_sink("image cache")
     validate_inbound_media_size(len(data), media_type="image")
     if not _looks_like_image(data):
         snippet = data[:80].decode("utf-8", errors="replace")
@@ -869,6 +876,7 @@ async def cache_image_from_url(url: str, ext: str = ".jpg", retries: int = 2) ->
     Raises:
         ValueError: If the URL targets a private/internal network (SSRF protection).
     """
+    _d0b_refuse_platform_sink("image URL cache")
     from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
     if not is_safe_url(url):
         raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
@@ -921,6 +929,7 @@ def _cleanup_cache_dir(cache_dir: Path, max_age_hours: int) -> int:
     Shared implementation behind every ``cleanup_*_cache`` helper — one loop,
     not N copies.  Returns the number of files removed.
     """
+    _d0b_refuse_platform_sink("cache cleanup")
     import time
 
     cutoff = time.time() - (max_age_hours * 3600)
@@ -941,6 +950,7 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
 
     Returns the number of files removed.
     """
+    _d0b_refuse_platform_sink("image cache cleanup")
     return _cleanup_cache_dir(get_image_cache_dir(), max_age_hours)
 
 
@@ -956,6 +966,7 @@ AUDIO_CACHE_DIR = get_hermes_dir("cache/audio", "audio_cache")
 
 def get_audio_cache_dir() -> Path:
     """Return the audio cache directory, creating it if it doesn't exist."""
+    _d0b_refuse_platform_sink("audio cache directory")
     d = _resolve_cache_dir("AUDIO_CACHE_DIR", "cache/audio", "audio_cache")
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -984,6 +995,7 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     Returns:
         Absolute path to the cached audio file as a string.
     """
+    _d0b_refuse_platform_sink("audio cache")
     validate_inbound_media_size(len(data), media_type="audio")
     cache_dir = get_audio_cache_dir()
     sniffed_ext = _sniff_audio_ext(data, ext)
@@ -1011,6 +1023,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
     Raises:
         ValueError: If the URL targets a private/internal network (SSRF protection).
     """
+    _d0b_refuse_platform_sink("audio URL cache")
     from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
     if not is_safe_url(url):
         raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
@@ -1062,6 +1075,7 @@ def cleanup_audio_cache(max_age_hours: int = 24) -> int:
 
     Returns the number of files removed.
     """
+    _d0b_refuse_platform_sink("audio cache cleanup")
     return _cleanup_cache_dir(get_audio_cache_dir(), max_age_hours)
 
 
@@ -1085,6 +1099,7 @@ SUPPORTED_VIDEO_TYPES = {
 
 def get_video_cache_dir() -> Path:
     """Return the video cache directory, creating it if it doesn't exist."""
+    _d0b_refuse_platform_sink("video cache directory")
     d = _resolve_cache_dir("VIDEO_CACHE_DIR", "cache/videos", "video_cache")
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -1092,6 +1107,7 @@ def get_video_cache_dir() -> Path:
 
 def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
     """Save raw video bytes to the cache and return the absolute file path."""
+    _d0b_refuse_platform_sink("video cache")
     validate_inbound_media_size(len(data), media_type="video")
     cache_dir = get_video_cache_dir()
     filename = f"video_{uuid.uuid4().hex[:12]}{ext}"
@@ -1106,6 +1122,7 @@ def cleanup_video_cache(max_age_hours: int = 24) -> int:
 
     Returns the number of files removed.
     """
+    _d0b_refuse_platform_sink("video cache cleanup")
     return _cleanup_cache_dir(get_video_cache_dir(), max_age_hours)
 
 
@@ -1122,6 +1139,7 @@ SCREENSHOT_CACHE_DIR = get_hermes_dir("cache/screenshots", "browser_screenshots"
 
 def get_screenshot_cache_dir() -> Path:
     """Return the browser screenshot cache directory, creating it if needed."""
+    _d0b_refuse_platform_sink("screenshot cache directory")
     d = _resolve_cache_dir("SCREENSHOT_CACHE_DIR", "cache/screenshots", "browser_screenshots")
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -1133,6 +1151,7 @@ def cleanup_screenshot_cache(max_age_hours: int = 24) -> int:
 
     Returns the number of files removed.
     """
+    _d0b_refuse_platform_sink("screenshot cache cleanup")
     return _cleanup_cache_dir(get_screenshot_cache_dir(), max_age_hours)
 
 
@@ -1259,25 +1278,8 @@ def _profile_cache_roots() -> List[Path]:
 
 
 def _kanban_attachment_roots() -> List[Path]:
-    """Return durable Kanban attachment roots without importing kanban_db."""
-    override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
-    if override:
-        return [Path(override).expanduser()]
-    home_override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    root = Path(home_override).expanduser() if home_override else _HERMES_ROOT
-    roots = [root / "kanban" / "attachments"]
-    boards_root = root / "kanban" / "boards"
-    try:
-        board_dirs = [
-            path for path in boards_root.iterdir()
-            if path.is_dir() and not path.is_symlink()
-            and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", path.name)
-            and (path / "kanban.db").is_file()
-        ]
-    except OSError:
-        return roots
-    roots.extend(path / "attachments" for path in board_dirs)
-    return roots
+    """Return no path roots; D0B admits attachment bytes only via the writer."""
+    return []
 
 
 def _media_delivery_allowed_roots() -> List[Path]:
@@ -1872,6 +1874,7 @@ def _strip_media_tag_directives(text: str) -> str:
 
 def get_document_cache_dir() -> Path:
     """Return the document cache directory, creating it if it doesn't exist."""
+    _d0b_refuse_platform_sink("document cache directory")
     d = _resolve_cache_dir("DOCUMENT_CACHE_DIR", "cache/documents", "document_cache")
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -1894,6 +1897,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     Raises:
         ValueError: If the sanitized path escapes the cache directory.
     """
+    _d0b_refuse_platform_sink("document cache")
     cache_dir = get_document_cache_dir()
     # Sanitize: strip directory components, null bytes, and control characters
     safe_name = Path(filename).name if filename else "document"
@@ -1915,6 +1919,7 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
 
     Returns the number of files removed.
     """
+    _d0b_refuse_platform_sink("document cache cleanup")
     return _cleanup_cache_dir(get_document_cache_dir(), max_age_hours)
 
 
@@ -1979,6 +1984,7 @@ def cache_media_bytes(
     ``application/octet-stream``); only images that fail validation
     (``cache_image_from_bytes`` raises ValueError) return None.
     """
+    _d0b_refuse_platform_sink("media cache")
     from tools.credential_files import to_agent_visible_cache_path
 
     ext = _resolve_media_ext(filename, mime_type)
@@ -3022,6 +3028,7 @@ class BasePlatformAdapter(ABC):
         Default implementation raises NotImplementedError; adapters that
         also return True from :meth:`supports_draft_streaming` must override.
         """
+        _d0b_refuse_platform_sink("send_draft")
         raise NotImplementedError(
             f"{type(self).__name__} does not implement send_draft"
         )
@@ -3485,7 +3492,7 @@ class BasePlatformAdapter(ABC):
 
         Returns True if connection was successful.
         """
-        pass
+        _d0b_refuse_platform_sink("connect")
     
     @abstractmethod
     async def disconnect(self) -> None:
@@ -3512,7 +3519,7 @@ class BasePlatformAdapter(ABC):
         Returns:
             SendResult with success status and message ID
         """
-        pass
+        _d0b_refuse_platform_sink("send")
 
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
@@ -3576,6 +3583,7 @@ class BasePlatformAdapter(ABC):
         response (typically when ``got_done`` fires in the stream
         consumer) and leave it ``False`` on intermediate edits.
         """
+        _d0b_refuse_platform_sink("edit_message")
         return SendResult(success=False, error="Not supported")
 
     async def delete_message(
@@ -3597,6 +3605,7 @@ class BasePlatformAdapter(ABC):
         Subclasses should override for platforms with a deletion API
         (e.g. Telegram ``deleteMessage``).
         """
+        _d0b_refuse_platform_sink("delete_message")
         return False
 
     def _get_ephemeral_system_ttl_default(self) -> int:
@@ -3635,6 +3644,8 @@ class BasePlatformAdapter(ABC):
         too old for Telegram's 48h window) are swallowed at debug level.
         Does not block the caller.
         """
+
+        _d0b_refuse_platform_sink("ephemeral delete scheduling")
 
         async def _run_delete() -> None:
             try:
@@ -3775,6 +3786,7 @@ class BasePlatformAdapter(ABC):
         adapter stores it alongside any platform-specific state needed to
         route the callback (e.g. Telegram's ``_approval_state`` dict).
         """
+        _d0b_refuse_platform_sink("send_slash_confirm")
         return SendResult(success=False, error="Not supported")
 
     async def send_clarify(
@@ -3815,6 +3827,7 @@ class BasePlatformAdapter(ABC):
         Adapters with native button UIs (Telegram, Discord) SHOULD
         override this for a richer UX.
         """
+        _d0b_refuse_platform_sink("send_clarify")
         if choices:
             # Multi-select clarifies register their flag on the pending entry;
             # look it up by id so the signature stays adapter-compatible.
@@ -3864,6 +3877,7 @@ class BasePlatformAdapter(ABC):
         The default implementation falls back to a normal send so callers can
         use one code path across platforms.
         """
+        _d0b_refuse_platform_sink("send_private_notice")
         return await self.send(
             chat_id=chat_id,
             content=content,
@@ -3878,7 +3892,7 @@ class BasePlatformAdapter(ABC):
         Override in subclasses if the platform supports it.
         metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
         """
-        pass
+        _d0b_refuse_platform_sink("send_typing")
 
     async def stop_typing(self, chat_id: str) -> None:
         """Stop a persistent typing indicator (if the platform uses one).
@@ -3931,6 +3945,7 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to bundle into a single native API call
         (e.g. Signal's multi-attachment RPC)
         """
+        _d0b_refuse_platform_sink("send_multiple_images")
         from urllib.parse import unquote as _unquote
 
         for image_url, alt_text in images:
@@ -3984,6 +3999,7 @@ class BasePlatformAdapter(ABC):
         instead of plain-text URLs. Default falls back to sending the
         URL as a text message.
         """
+        _d0b_refuse_platform_sink("send_image")
         # Fallback: send URL as text (subclasses override for native images)
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
@@ -4003,6 +4019,7 @@ class BasePlatformAdapter(ABC):
         (e.g., Telegram send_animation) so they auto-play inline.
         Default falls back to send_image.
         """
+        _d0b_refuse_platform_sink("send_animation")
         return await self.send_image(chat_id=chat_id, image_url=animation_url, caption=caption, reply_to=reply_to, metadata=metadata)
     
     @staticmethod
@@ -4076,6 +4093,7 @@ class BasePlatformAdapter(ABC):
         notice — never echo the local audio_path into chat, since it is a
         host filesystem path that would leak the Hermes home layout.
         """
+        _d0b_refuse_platform_sink("send_voice")
         # audio_path is intentionally NOT included in the chat text — it is a
         # host-local path that leaks filesystem layout. The path is logged for
         # operator diagnostics instead.
@@ -4219,6 +4237,7 @@ class BasePlatformAdapter(ABC):
         video_path into chat, since it is a host filesystem path that
         would leak the Hermes home layout.
         """
+        _d0b_refuse_platform_sink("send_video")
         # See send_voice for the rationale: do not echo host paths into chat.
         logger.warning(
             "[%s] send_video fallback: native video send unavailable for %s",
@@ -4247,6 +4266,7 @@ class BasePlatformAdapter(ABC):
         file_path into chat, since it is a host filesystem path that
         would leak the Hermes home layout.
         """
+        _d0b_refuse_platform_sink("send_document")
         # See send_voice for the rationale: do not echo host paths into chat.
         logger.warning(
             "[%s] send_document fallback: native file send unavailable for %s",
@@ -4278,6 +4298,7 @@ class BasePlatformAdapter(ABC):
         example Discord accepted the message but attached nothing), the user
         must see a failure notice instead of a silent drop (#66797).
         """
+        _d0b_refuse_platform_sink("media delivery failure notice")
         ext = Path(media_path).suffix.lower()
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         if is_voice or should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
@@ -4320,6 +4341,7 @@ class BasePlatformAdapter(ABC):
         chat, since it is a host filesystem path that would leak the
         Hermes home layout.
         """
+        _d0b_refuse_platform_sink("send_image_file")
         # See send_voice for the rationale: do not echo host paths into chat.
         logger.warning(
             "[%s] send_image_file fallback: native image send unavailable for %s",
@@ -5057,6 +5079,7 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        _d0b_refuse_platform_sink("send retry")
         result = await self.send(
             chat_id=chat_id,
             content=content,

@@ -13,6 +13,8 @@ _profile_scoped = _registry.profile_scoped
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.create", rid)
+
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
     cols = int(params.get("cols", 80))
@@ -305,6 +307,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.resume", rid)
+
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -724,6 +728,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.cwd.set")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.cwd.set", rid)
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -792,6 +798,8 @@ def _(rid, params: dict) -> dict:
     This intentionally does not close the previously focused session; it merely
     returns enough state for Ink to redraw around another live session id.
     """
+    return _d0b_tui_refused("session.activate", rid)
+
     sid = str(params.get("session_id") or "")
     session, err = _sess_nowait({"session_id": sid}, rid)
     if err:
@@ -824,6 +832,8 @@ def _(rid, params: dict) -> dict:
     Honors ``params.profile`` so app-global remote mode deletes from the
     focused profile's ``state.db`` + sessions dir (mirrors ``session.resume``).
     """
+    return _d0b_tui_refused("session.delete", rid)
+
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -862,6 +872,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.title")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.title", rid)
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -953,6 +965,8 @@ def _(rid, params: dict) -> dict:
     unconditionally. ``row_id`` is the durable ``messages.id`` forwarded by
     ``_history_to_messages`` — the renderer's own message ids are ephemeral.
     """
+    return _d0b_tui_refused("message.react", rid)
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -1067,6 +1081,8 @@ def _(rid, params: dict) -> dict:
     home channel, and forges a synthetic turn. The desktop then polls
     ``handoff.state`` for the terminal result.
     """
+    return _d0b_tui_refused("handoff.request", rid)
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -1178,6 +1194,8 @@ def _(rid, params: dict) -> dict:
     Desktop calls this when its bounded poll times out. Only pending/running
     rows are changed so a late success from the gateway watcher is not clobbered.
     """
+    return _d0b_tui_refused("handoff.fail", rid)
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -2206,6 +2224,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.status")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.status", rid)
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -2306,6 +2326,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.undo")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.undo", rid)
+
     session, err = _sess(params, rid)
     if err:
         return err
@@ -2341,6 +2363,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.compress")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.compress", rid)
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -2513,6 +2537,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.save")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.save", rid)
+
     session, err = _sess(params, rid)
     if err:
         return err
@@ -2585,6 +2611,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.close")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.close", rid)
+
     sid = params.get("session_id", "")
     # Serialize only the ownership claim against session.resume / the orphan
     # reaper. Finalization may run arbitrary plugin/agent cleanup and must not
@@ -2597,6 +2625,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.branch")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.branch", rid)
+
     session, err = _sess(params, rid)
     if err:
         return err
@@ -2749,6 +2779,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("session.interrupt", rid)
+
     # Keypress barge-in: stopping the turn also silences its streaming TTS
     # (voice is process-global, so no per-session scoping is needed).
     _tts_stream_stop()
@@ -2862,6 +2894,8 @@ def _(rid, params: dict) -> dict:
 
 @method("spawn_tree.save")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("spawn_tree.save", rid)
+
     session_id = str(params.get("session_id") or "").strip()
     subagents = params.get("subagents") or []
     if not isinstance(subagents, list) or not subagents:
@@ -2905,6 +2939,8 @@ def _(rid, params: dict) -> dict:
 
 @method("spawn_tree.list")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("spawn_tree.list", rid)
+
     session_id = str(params.get("session_id") or "").strip()
     limit = int(params.get("limit") or 50)
     cross_session = bool(params.get("cross_session"))
@@ -2956,6 +2992,8 @@ def _(rid, params: dict) -> dict:
 
 @method("spawn_tree.load")
 def _(rid, params: dict) -> dict:
+    return _d0b_tui_refused("spawn_tree.load", rid)
+
     from pathlib import Path
 
     raw_path = str(params.get("path") or "").strip()
@@ -2987,6 +3025,8 @@ def _(rid, params: dict) -> dict:
     it on its next iteration. No interrupt, no new user turn, no role
     alternation violation.
     """
+    return _d0b_tui_refused("session.steer", rid)
+
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")
@@ -3014,6 +3054,8 @@ def _(rid, params: dict) -> dict:
 @method("session.redirect")
 def _(rid, params: dict) -> dict:
     """Redirect the active model turn while preserving valid work/context."""
+    return _d0b_tui_refused("session.redirect", rid)
+
     text = (params.get("text") or "").strip()
     if not text:
         return _err(rid, 4002, "text is required")

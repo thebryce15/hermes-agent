@@ -40,6 +40,11 @@ from hermes_cli.browser_connect import (
 )
 
 
+def _d0b_cli_refused(route: str) -> None:
+    """Refuse legacy goal/image routes before they touch local state."""
+    print(f"{route} refused by the D0B admission boundary", file=sys.stderr)
+
+
 class CLICommandsMixin:
     """Mixin holding the interactive-CLI slash-command handlers.
 
@@ -588,6 +593,8 @@ class CLICommandsMixin:
 
     def _handle_image_command(self, cmd_original: str):
         """Handle /image <path> — attach a local image file for the next prompt."""
+        return _d0b_cli_refused("/image")
+
         from cli import _DIM, _IMAGE_EXTENSIONS, _RST, _cprint, _resolve_attachment_path, _split_path_input, _termux_example_image_path
         raw_args = (cmd_original.split(None, 1)[1].strip() if " " in cmd_original else "")
         if not raw_args:
@@ -2296,6 +2303,8 @@ class CLICommandsMixin:
 
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / status / pause / resume / clear."""
+        return _d0b_cli_refused("/goal")
+
         from cli import _DIM, _RST, _cprint
         parts = (cmd or "").strip().split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""

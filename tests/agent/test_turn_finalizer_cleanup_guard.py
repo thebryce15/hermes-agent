@@ -1,11 +1,7 @@
-"""Regression test for #8049.
+"""U1-D0B regression proof for the post-loop finalization boundary.
 
-When the post-loop cleanup chain in ``finalize_turn`` raises — trajectory
-save (file I/O), resource teardown (remote VM/browser), or session
-persistence (SQLite) — the partial ``final_response`` the caller is waiting
-for must still be returned.  Previously any of those raised straight out of
-``run_conversation``, so a subprocess wrapper saw an empty stdout with no
-traceback and lost the whole turn.
+The legacy route previously performed trajectory, cleanup, and persistence
+effects.  D0B requires it to refuse at entry before any callback can run.
 """
 
 import pytest
@@ -28,6 +24,7 @@ class _StubAgent:
 
     def __init__(self, *, raise_in):
         self._raise_in = set(raise_in)
+        self.effect_calls = []
         self.max_iterations = 3
         self.iteration_budget = _StubBudget()
         self.context_compressor = _StubCompressor()
@@ -60,10 +57,12 @@ class _StubAgent:
 
     # --- fallible cleanup surfaces -------------------------------------
     def _save_trajectory(self, *a, **k):
+        self.effect_calls.append("save_trajectory")
         if "save_trajectory" in self._raise_in:
             raise RuntimeError("trajectory disk full")
 
     def _cleanup_task_resources(self, *a, **k):
+        self.effect_calls.append("cleanup_task_resources")
         if "cleanup_task_resources" in self._raise_in:
             raise RuntimeError("docker teardown EOF")
 
@@ -71,6 +70,7 @@ class _StubAgent:
         pass
 
     def _persist_session(self, *a, **k):
+        self.effect_calls.append("persist_session")
         if "persist_session" in self._raise_in:
             raise RuntimeError("sqlite database is locked")
 
@@ -140,27 +140,25 @@ def _run(
 @pytest.mark.parametrize(
     "step", ["save_trajectory", "cleanup_task_resources", "persist_session"]
 )
-def test_single_cleanup_step_raises_does_not_skip_others(step):
+def test_finalize_turn_refuses_before_armed_cleanup_effect(step):
     agent = _StubAgent(raise_in=(step,))
     result = _run(agent)
-    # Response survives.
-    assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
-    # Exactly the failing step is recorded; the others ran without error.
-    assert result["cleanup_errors"] == [
-        next(
-            e
-            for e in result["cleanup_errors"]
-            if e.startswith(step)
-        )
-    ]
-    assert len(result["cleanup_errors"]) == 1
+    assert result == {
+        "completed": False,
+        "error": "finalize_turn refused by the D0B admission boundary",
+        "final_response": None,
+        "refused": True,
+    }
+    assert agent.effect_calls == []
 
 
-def test_clean_turn_has_no_cleanup_errors_key():
+def test_finalize_turn_refuses_before_clean_cleanup_chain():
     agent = _StubAgent(raise_in=())
     result = _run(agent)
-    assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
-    assert result["completed"] is False
-    assert "cleanup_errors" not in result
-
-
+    assert result == {
+        "completed": False,
+        "error": "finalize_turn refused by the D0B admission boundary",
+        "final_response": None,
+        "refused": True,
+    }
+    assert agent.effect_calls == []

@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -79,6 +80,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -159,7 +161,9 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
-KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+# Decoded attachment ceiling for the privileged writer. 700 KiB leaves room
+# for base64 expansion and the closed JSON envelope inside its 1 MiB frame.
+KANBAN_ATTACHMENT_MAX_BYTES = 700 * 1024
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -1175,6 +1179,9 @@ class Event:
     payload: Optional[dict]
     created_at: int
     run_id: Optional[int] = None
+    request_key: Optional[str] = None
+    request_digest: Optional[str] = None
+    request_result: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1297,7 +1304,10 @@ CREATE TABLE IF NOT EXISTS task_events (
     run_id     INTEGER,
     kind       TEXT NOT NULL,
     payload    TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    request_key TEXT,
+    request_digest TEXT,
+    request_result TEXT
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -1421,7 +1431,62 @@ def _resolve_busy_timeout_ms() -> int:
     return DEFAULT_BUSY_TIMEOUT_MS
 
 
-def _sqlite_connect(path: Path) -> sqlite3.Connection:
+@dataclass(frozen=True)
+class ExistingDbIdentity:
+    """Stable filesystem identity for a pre-existing production board."""
+
+    resolved: Path
+    device: int
+    inode: int
+
+
+class ExistingKanbanDbError(RuntimeError):
+    """Raised when a production board target is absent, unsafe, or changed."""
+
+
+def existing_db_identity(path: Path) -> ExistingDbIdentity:
+    """Validate and identify an existing non-symlink, non-empty DB file."""
+
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    current = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            current /= part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise ExistingKanbanDbError(
+                    f"production Kanban DB path contains a symlink: {current}"
+                )
+        first = path.lstat()
+        resolved = path.resolve(strict=True)
+        second = path.lstat()
+    except ExistingKanbanDbError:
+        raise
+    except (FileNotFoundError, OSError) as exc:
+        raise ExistingKanbanDbError(
+            f"production Kanban DB must be an existing non-empty regular file: {path}"
+        ) from exc
+    if (
+        not stat.S_ISREG(first.st_mode)
+        or first.st_size <= 0
+        or not stat.S_ISREG(second.st_mode)
+        or second.st_size <= 0
+    ):
+        raise ExistingKanbanDbError(
+            f"production Kanban DB must be an existing non-empty regular file: {path}"
+        )
+    first_key = (first.st_dev, first.st_ino)
+    second_key = (second.st_dev, second.st_ino)
+    if first_key != second_key or resolved != path:
+        raise ExistingKanbanDbError(
+            f"production Kanban DB changed after validation: {path}"
+        )
+    return ExistingDbIdentity(resolved, int(first.st_dev), int(first.st_ino))
+
+
+def _sqlite_connect(path: Path, *, existing_only: bool = False) -> sqlite3.Connection:
     """Open a Kanban SQLite connection with consistent lock waiting.
 
     Uses ``connect_tracked`` so the live-connection registry knows this file
@@ -1433,11 +1498,17 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
+    target: Path | str = path
+    kwargs = {}
+    if existing_only:
+        target = f"{path.resolve(strict=True).as_uri()}?mode=rw"
+        kwargs = {"uri": True, "tracking_path": path}
     conn = connect_tracked(
-        path,
+        target,
         connect_fn=sqlite3.connect,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
+        **kwargs,
     )
     # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
     # the PRAGMA explicitly so it is observable and survives future wrapper
@@ -2150,6 +2221,8 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    require_existing: bool = False,
+    expected_identity: Optional[ExistingDbIdentity] = None,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
@@ -2170,9 +2243,42 @@ def connect(
       ``<root>/kanban/current`` → ``default``.
     """
     if db_path is not None:
-        path = db_path
+        path = Path(db_path)
     else:
         path = kanban_db_path(board=board)
+    if require_existing:
+        identity = existing_db_identity(path)
+        if expected_identity is not None and identity != expected_identity:
+            raise ExistingKanbanDbError(
+                f"production Kanban DB changed after validation: {path}"
+            )
+        _validate_sqlite_header(identity.resolved)
+        conn = _sqlite_connect(identity.resolved, existing_only=True)
+        try:
+            current_identity = existing_db_identity(path)
+            if current_identity != identity:
+                raise ExistingKanbanDbError(
+                    f"production Kanban DB changed after validation: {path}"
+                )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA secure_delete=ON")
+            conn.execute("PRAGMA cell_size_check=ON")
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('tasks', 'task_events')"
+                )
+            }
+            if tables != {"tasks", "task_events"}:
+                raise ExistingKanbanDbError(
+                    "production Kanban DB is not initialized with the writer schema"
+                )
+        except Exception:
+            conn.close()
+            raise
+        return conn
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2494,6 +2600,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+    if "request_key" not in ev_cols:
+        _add_column_if_missing(conn, "task_events", "request_key", "request_key TEXT")
+    if "request_digest" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "request_digest", "request_digest TEXT"
+        )
+    if "request_result" not in ev_cols:
+        _add_column_if_missing(
+            conn, "task_events", "request_result", "request_result TEXT"
+        )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -2501,6 +2617,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_request_key "
+        "ON task_events(request_key) WHERE request_key IS NOT NULL"
     )
 
     notify_table_exists = conn.execute(
@@ -2614,10 +2734,13 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_events ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, created_at INTEGER NOT NULL)",
+        " payload TEXT, created_at INTEGER NOT NULL,"
+        " request_key TEXT, request_digest TEXT, request_result TEXT)",
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE UNIQUE INDEX idx_events_request_key "
+            "ON task_events(request_key) WHERE request_key IS NOT NULL",
         ),
     ),
     "task_comments": (
@@ -2906,6 +3029,9 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3117,19 +3243,33 @@ def create_task(
         skills_list = cleaned
 
     # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # duplicate. A writer request is only allowed to replay when its atomic
+    # event marker already exists and matches the same digest. A legacy task
+    # row with an idempotency key but no matching marker is ambiguous: do not
+    # attach a new request digest to it or create a suffixed replay marker.
     if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+        with write_txn(conn):
+            row = conn.execute(
+                (
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    + ("" if request_key is not None else "AND status != 'archived' ")
+                    + "ORDER BY created_at DESC LIMIT 1"
+                ),
+                (idempotency_key,),
+            ).fetchone()
+            if row:
+                if request_key is not None:
+                    marker = request_binding(conn, request_key)
+                    if (
+                        marker is None
+                        or marker["task_id"] != row["id"]
+                        or marker["request_digest"] != request_digest
+                    ):
+                        raise ValueError(
+                            "idempotency key points to an existing task without "
+                            "a matching atomic request marker; reconcile before retry"
+                        )
+                return row["id"]
 
     now = int(time.time())
 
@@ -3269,6 +3409,13 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
+                    request_key=request_key,
+                    request_digest=request_digest,
+                    request_result=(
+                        dict(request_result)
+                        if request_result
+                        else {"task_id": task_id}
+                    ),
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
@@ -3405,7 +3552,15 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -3434,7 +3589,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+        _append_event(
+            conn, task_id, "assigned", {"assignee": profile},
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {"ok": True},
+        )
         return True
 
 
@@ -3525,7 +3684,15 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
+) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -3552,6 +3719,8 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         _append_event(
             conn, child_id, "linked",
             {"parent": parent_id, "child": child_id},
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {"ok": True},
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
 
@@ -3579,7 +3748,15 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
+) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -3589,7 +3766,21 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
             _append_event(
                 conn, child_id, "unlinked",
                 {"parent": parent_id, "child": child_id},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": True},
             )
+        elif request_key is not None:
+            task_count = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE id IN (?, ?)",
+                (parent_id, child_id),
+            ).fetchone()[0]
+            if task_count == 2:
+                _append_event(
+                    conn, child_id, "unlink_rejected",
+                    {"parent": parent_id, "child": child_id, "reason": "link_missing"},
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {"ok": False},
+                )
         removed = cur.rowcount > 0
     if removed:
         # Dependency edge removed — re-evaluate promotion eligibility for the
@@ -3636,7 +3827,14 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -3653,7 +3851,11 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn, task_id, "commented", {"author": author, "len": len(body)},
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {"comment_id": int(cur.lastrowid or 0)},
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -3721,6 +3923,10 @@ class AttachmentTooLarge(ValueError):
     """
 
 
+class AttachmentConflict(ValueError):
+    """Raised when a fixed attachment name is already occupied or bound."""
+
+
 def _safe_attachment_name(raw: str) -> str:
     """Reduce a client-supplied filename to a safe basename.
 
@@ -3751,10 +3957,125 @@ def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
     stem, dot, ext = safe_name.partition(".")
     candidate = safe_name
     n = 1
-    while (dest_dir / candidate).exists():
+    # ``exists()`` follows symlinks and returns false for dangling links.  A
+    # writer must treat either form as occupied or a subsequent write could
+    # follow a client-planted link outside the attachment root.
+    while os.path.lexists(dest_dir / candidate):
         candidate = f"{stem} ({n}){dot}{ext}"
         n += 1
     return dest_dir / candidate
+
+
+def _write_attachment_bytes_exclusive(path: Path, data: bytes) -> None:
+    """Create an attachment without following a raced/replaced symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o660)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(data)
+    finally:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _assert_no_symlink_components(path: Path) -> None:
+    """Reject existing symlink components before a portable path operation."""
+    path = Path(path)
+    current = Path(path.anchor) if path.anchor else Path.cwd()
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            raise AttachmentConflict(f"attachment path contains symlink: {path}")
+
+
+def _open_attachment_directory(root: Path, task_id: str) -> tuple[Optional[int], Path]:
+    """Open a task directory without following redirects on POSIX.
+
+    The returned fd is owned by the caller and must be closed.  ``None`` is
+    returned on platforms without dirfd-relative operations, after the
+    portable symlink checks have run.
+    """
+    if not task_id or Path(task_id).name != task_id or task_id in {".", ".."}:
+        raise AttachmentConflict("attachment task id must be one path component")
+    root = Path(root)
+    _assert_no_symlink_components(root)
+    root.mkdir(parents=True, exist_ok=True)
+    task_dir = root / task_id
+    _assert_no_symlink_components(task_dir)
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        task_dir.mkdir(parents=True, exist_ok=True)
+        _assert_no_symlink_components(task_dir)
+        return None, task_dir
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(root, flags)
+    try:
+        try:
+            os.mkdir(task_id, 0o770, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        task_fd = os.open(task_id, flags, dir_fd=root_fd)
+    except Exception:
+        os.close(root_fd)
+        raise
+    os.close(root_fd)
+    return task_fd, task_dir
+
+
+def _write_attachment_fd_exclusive(
+    task_fd: Optional[int], task_dir: Path, filename: str, data: bytes,
+) -> None:
+    """Create a fixed attachment with O_NOFOLLOW/O_EXCL where available."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if task_fd is not None and hasattr(os, "supports_dir_fd") and os.open in os.supports_dir_fd:
+        fd = os.open(filename, flags, 0o660, dir_fd=task_fd)
+    else:
+        fd = os.open(task_dir / filename, flags, 0o660)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(data)
+    finally:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _read_attachment_fd(
+    task_fd: Optional[int], task_dir: Path, filename: str, max_bytes: int,
+) -> Optional[bytes]:
+    """Read a fixed attachment without following a symlink."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        if task_fd is not None and hasattr(os, "supports_dir_fd") and os.open in os.supports_dir_fd:
+            fd = os.open(filename, flags, dir_fd=task_fd)
+        else:
+            fd = os.open(task_dir / filename, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise AttachmentConflict("attachment path contains symlink") from exc
+        raise
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            content = handle.read(max_bytes + 1)
+    finally:
+        if fd != -1:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    if len(content) > max_bytes:
+        raise AttachmentConflict("existing attachment exceeds the fixed byte limit")
+    return content
 
 
 def store_attachment_bytes(
@@ -3789,7 +4110,7 @@ def store_attachment_bytes(
         max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
     if len(data) > max_bytes:
         raise AttachmentTooLarge(
-            f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
+            f"attachment exceeds {max_bytes} decoded bytes"
         )
     safe_name = _safe_attachment_name(filename)
     dest_dir = task_attachments_dir(task_id, board=board)
@@ -3816,6 +4137,162 @@ def store_attachment_bytes(
         raise
 
 
+def store_attachment_bytes_fixed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    filename: str,
+    data: bytes,
+    *,
+    attachments_root: Path,
+    content_type: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """Store inline bytes with deterministic, crash-recoverable evidence.
+
+    The request marker is committed in the existing event stream before the
+    blob is touched. A retry can therefore reconcile only the exact request
+    digest and content hash; it never creates a suffixed duplicate.
+    """
+    if max_bytes is None:
+        max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
+    if len(data) > max_bytes:
+        raise AttachmentTooLarge(
+            f"attachment exceeds {max_bytes} decoded bytes"
+        )
+    if not request_key or not request_digest:
+        raise ValueError("fixed attachments require an atomic request marker")
+    safe_name = _safe_attachment_name(filename)
+    # Do not resolve before checking: resolving a caller-provided symlinked
+    # root would silently redirect the fixed writer to another tree.  The
+    # dirfd/O_NOFOLLOW open below then closes the remaining POSIX race.
+    root = Path(attachments_root)
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    _assert_no_symlink_components(root)
+    root = root.resolve()
+    if not task_id or Path(task_id).name != task_id or task_id in {".", ".."}:
+        raise AttachmentConflict("attachment task id must be one path component")
+    dest_dir = root / task_id
+    try:
+        dest_dir.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("attachment task directory escapes fixed root") from exc
+    content_digest = hashlib.sha256(data).hexdigest()
+    expected = {"filename": safe_name, "sha256": content_digest, "size": len(data)}
+    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+        raise ValueError(f"unknown task {task_id}")
+
+    marker = request_binding(conn, request_key)
+    if marker is not None:
+        if marker["request_digest"] != request_digest or marker["task_id"] != task_id:
+            raise AttachmentConflict("attachment request marker does not match this retry")
+        if marker["kind"] not in {"attachment_pending", "attached"}:
+            raise AttachmentConflict("request key is bound to a different operation")
+        bound = marker.get("result") or {}
+        if any(bound.get(key) != value for key, value in expected.items()):
+            raise AttachmentConflict("attachment retry does not match bound content")
+        if marker["kind"] == "attached":
+            attachment_id = bound.get("attachment_id")
+            row = conn.execute(
+                "SELECT id, filename, stored_path, size FROM task_attachments "
+                "WHERE id = ? AND task_id = ?",
+                (attachment_id, task_id),
+            ).fetchone()
+            if row is None or row["filename"] != safe_name or int(row["size"] or 0) != len(data):
+                raise AttachmentConflict("attached marker has no matching attachment row")
+            task_fd, task_dir = _open_attachment_directory(root, task_id)
+            try:
+                existing = _read_attachment_fd(task_fd, task_dir, safe_name, max_bytes)
+            finally:
+                if task_fd is not None:
+                    os.close(task_fd)
+            if existing is None or hashlib.sha256(existing).hexdigest() != content_digest:
+                raise AttachmentConflict("attached marker points to a missing or changed blob")
+            return int(row["id"])
+    else:
+        # This commit is the durable recovery anchor. The event stores both
+        # the canonical request digest and the deterministic blob hash.
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "attachment_pending", expected,
+                request_key=request_key, request_digest=request_digest,
+                request_result=expected,
+            )
+        marker = request_binding(conn, request_key)
+
+    if marker is None:  # pragma: no cover - defensive after the insert above
+        raise AttachmentConflict("attachment request marker could not be recorded")
+
+    task_fd, task_dir = _open_attachment_directory(root, task_id)
+    try:
+        existing = _read_attachment_fd(task_fd, task_dir, safe_name, max_bytes)
+        if existing is None:
+            try:
+                _write_attachment_fd_exclusive(task_fd, task_dir, safe_name, data)
+            except FileExistsError:
+                existing = _read_attachment_fd(task_fd, task_dir, safe_name, max_bytes)
+                if (
+                    existing is None
+                    or len(existing) != len(data)
+                    or hashlib.sha256(existing).hexdigest() != content_digest
+                ):
+                    raise AttachmentConflict(
+                        "fixed attachment path became occupied; reconcile before retry"
+                    )
+        elif len(existing) != len(data) or hashlib.sha256(existing).hexdigest() != content_digest:
+            raise AttachmentConflict(
+                "fixed attachment path contains different bytes; reconcile before retry"
+            )
+    finally:
+        if task_fd is not None:
+            os.close(task_fd)
+
+    dest_path = dest_dir / safe_name
+    with write_txn(conn):
+        binding = request_binding(conn, request_key)
+        if binding is None or binding["request_digest"] != request_digest:
+            raise AttachmentConflict("attachment request marker changed during reconciliation")
+        row = conn.execute(
+            "SELECT id, filename, stored_path, size FROM task_attachments "
+            "WHERE task_id = ? AND stored_path = ?",
+            (task_id, str(dest_path)),
+        ).fetchone()
+        if row is None:
+            cur = conn.execute(
+                "INSERT INTO task_attachments "
+                "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id, safe_name, str(dest_path), content_type,
+                    len(data), uploaded_by, int(time.time()),
+                ),
+            )
+            attachment_id = int(cur.lastrowid or 0)
+        else:
+            if (
+                row["filename"] != safe_name
+                or int(row["size"] or 0) != len(data)
+                or row["stored_path"] != str(dest_path)
+            ):
+                raise AttachmentConflict("existing attachment row conflicts with request")
+            attachment_id = int(row["id"])
+        final_result = {**expected, "attachment_id": attachment_id}
+        conn.execute(
+            "UPDATE task_events SET kind = 'attached', payload = ?, request_result = ? "
+            "WHERE id = ? AND request_key = ?",
+            (
+                json.dumps(expected, ensure_ascii=False, sort_keys=True),
+                json.dumps(final_result, ensure_ascii=False, sort_keys=True),
+                int(binding["event_id"]), request_key,
+            ),
+        )
+        return attachment_id
+
+
 def add_attachment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3825,6 +4302,9 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -3861,6 +4341,8 @@ def add_attachment(
             task_id,
             "attached",
             {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {"attachment_id": int(cur.lastrowid or 0)},
         )
         return int(cur.lastrowid or 0)
 
@@ -3938,6 +4420,14 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
             payload = json.loads(r["payload"]) if r["payload"] else None
         except Exception:
             payload = None
+        try:
+            request_result = (
+                json.loads(r["request_result"])
+                if "request_result" in r.keys() and r["request_result"]
+                else None
+            )
+        except Exception:
+            request_result = None
         out.append(
             Event(
                 id=r["id"],
@@ -3946,6 +4436,9 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
                 payload=payload,
                 created_at=r["created_at"],
                 run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+                request_key=(r["request_key"] if "request_key" in r.keys() else None),
+                request_digest=(r["request_digest"] if "request_digest" in r.keys() else None),
+                request_result=request_result,
             )
         )
     return out
@@ -3958,6 +4451,9 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Record an event row.  Called from within an already-open txn.
 
@@ -3966,13 +4462,69 @@ def _append_event(
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
     """
+    if (request_key is None) != (request_digest is None):
+        raise ValueError("request_key and request_digest must be supplied together")
+    if request_key is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", request_key):
+            raise ValueError("request_key must be 1-128 safe identifier characters")
+        if not re.fullmatch(r"[0-9a-f]{64}", request_digest or ""):
+            raise ValueError("request_digest must be a lowercase SHA-256 hex digest")
+        if run_id is not None:
+            run_row = conn.execute(
+                "SELECT task_id FROM task_runs WHERE id = ?", (int(run_id),)
+            ).fetchone()
+            if run_row is None or run_row["task_id"] != task_id:
+                raise ValueError("request event run_id does not belong to task")
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, now),
+    result_json = (
+        json.dumps(dict(request_result), ensure_ascii=False, sort_keys=True)
+        if request_result is not None else None
     )
+    conn.execute(
+        "INSERT INTO task_events "
+        "(task_id, run_id, kind, payload, created_at, request_key, request_digest, request_result) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (task_id, run_id, kind, pl, now, request_key, request_digest, result_json),
+    )
+
+
+def request_binding(
+    conn: sqlite3.Connection, request_key: str,
+) -> Optional[dict[str, Any]]:
+    """Return the existing writer marker for ``request_key``, if any.
+
+    Request markers live on the existing task-event stream. This is a read
+    helper only; callers perform the marker insert in the same write
+    transaction as the task/run mutation.
+    """
+    row = conn.execute(
+        "SELECT id, task_id, run_id, kind, request_digest, request_result "
+        "FROM task_events WHERE request_key = ?",
+        (request_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        result = json.loads(row["request_result"]) if row["request_result"] else None
+    except Exception:
+        result = None
+    return {
+        "event_id": int(row["id"]),
+        "task_id": row["task_id"],
+        "run_id": int(row["run_id"]) if row["run_id"] is not None else None,
+        "kind": row["kind"],
+        "request_digest": row["request_digest"],
+        "result": result,
+    }
+
+
+def request_digest(value: Any) -> str:
+    """Compute the canonical digest used by writer request markers."""
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _end_run(
@@ -4229,6 +4781,9 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4262,6 +4817,8 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": False},
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -4298,6 +4855,15 @@ def claim_task(
             (lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
+            if request_key is not None and conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone():
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "not_ready_or_claimed"},
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {"ok": False},
+                )
             return None
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
@@ -4333,6 +4899,10 @@ def claim_task(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {
+                "task_id": task_id, "run_id": int(run_id),
+            },
         )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
@@ -4351,6 +4921,9 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4382,6 +4955,15 @@ def claim_review_task(
             (lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
+            if request_key is not None and conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone():
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "not_review_or_claimed"},
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {"ok": False},
+                )
             return None
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key "
@@ -4416,6 +4998,10 @@ def claim_review_task(
             {"lock": lock, "expires": expires, "run_id": run_id,
              "source_status": "review"},
             run_id=run_id,
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {
+                "task_id": task_id, "run_id": int(run_id),
+            },
         )
         return get_task(conn, task_id)
 
@@ -4426,6 +5012,9 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
@@ -4447,7 +5036,25 @@ def heartbeat_claim(
                     "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
                     (expires, run_id),
                 )
+            if request_key is not None:
+                _append_event(
+                    conn, task_id, "heartbeat_claim", {"expires": expires},
+                    run_id=run_id,
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {
+                        "ok": True, "expires": expires, "run_id": run_id,
+                    },
+                )
             return True
+        if request_key is not None and conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            _append_event(
+                conn, task_id, "heartbeat_rejected",
+                {"reason": "claim_not_owned"},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": False},
+            )
         return False
 
 
@@ -4842,6 +5449,9 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4940,6 +5550,15 @@ def complete_task(
                 (result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
+            if request_key is not None and conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone():
+                _append_event(
+                    conn, task_id, "completion_rejected",
+                    {"reason": "state_or_run_mismatch"},
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {"ok": False},
+                )
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
@@ -5000,6 +5619,8 @@ def complete_task(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {"ok": True},
         )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
@@ -5622,6 +6243,9 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5690,6 +6314,13 @@ def block_task(
                 else (kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
+                if request_key is not None:
+                    _append_event(
+                        conn, task_id, "block_rejected",
+                        {"reason": "state_or_run_mismatch"},
+                        request_key=request_key, request_digest=request_digest,
+                        request_result=request_result or {"ok": False},
+                    )
                 return False
             run_id = _end_run(
                 conn, task_id,
@@ -5703,6 +6334,8 @@ def block_task(
             _append_event(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": True},
             )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
@@ -5743,6 +6376,13 @@ def block_task(
                 else (kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
+                if request_key is not None:
+                    _append_event(
+                        conn, task_id, "block_rejected",
+                        {"reason": "state_or_run_mismatch"},
+                        request_key=request_key, request_digest=request_digest,
+                        request_result=request_result or {"ok": False},
+                    )
                 return False
             run_id = _end_run(
                 conn, task_id,
@@ -5762,6 +6402,8 @@ def block_task(
                     "limit": BLOCK_RECURRENCE_LIMIT,
                 },
                 run_id=run_id,
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": True},
             )
         else:
             if expected_run_id is None:
@@ -5796,6 +6438,13 @@ def block_task(
                     (kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
+                if request_key is not None:
+                    _append_event(
+                        conn, task_id, "block_rejected",
+                        {"reason": "state_or_run_mismatch"},
+                        request_key=request_key, request_digest=request_digest,
+                        request_result=request_result or {"ok": False},
+                    )
                 return False
             run_id = _end_run(
                 conn, task_id,
@@ -5814,6 +6463,8 @@ def block_task(
                 conn, task_id, "blocked",
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": True},
             )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
@@ -5898,7 +6549,14 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -5956,10 +6614,21 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (new_status, task_id),
         )
         if cur.rowcount != 1:
+            if request_key is not None and conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone():
+                _append_event(
+                    conn, task_id, "unblock_rejected",
+                    {"reason": "not_blocked_or_scheduled"},
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {"ok": False},
+                )
             return False
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
+            request_key=request_key, request_digest=request_digest,
+            request_result=request_result or {"ok": True},
         )
         return True
 
@@ -9239,8 +9908,17 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    include_paths: bool = True,
+) -> str:
     """Return the full text a worker should read to understand its task.
+
+    ``include_paths=False`` is the privileged writer projection: it keeps the
+    same truthful task/parent/result context while withholding workspace and
+    attachment filesystem selectors from IPC consumers.
 
     Order:
       1. Task title (mandatory).
@@ -9287,7 +9965,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append(f"Status:   {task.status}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if include_paths:
+        lines.append(
+            f"Workspace: {task.workspace_kind} @ "
+            f"{task.workspace_path or '(unresolved)'}"
+        )
+    else:
+        lines.append(f"Workspace: {task.workspace_kind}")
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,
@@ -9306,23 +9990,27 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
-    # Attachments — files uploaded to this task (PDFs, source docs,
-    # images). Surface the absolute on-disk path so the worker, which has
-    # full file-tool access, can read them directly (read_file, terminal
-    # `pdftotext`, etc.). On the local terminal backend the path resolves
-    # as-is; remote backends need the kanban attachments dir mounted.
+    # Attachments — files uploaded to this task (PDFs, source docs, images).
+    # The privileged IPC projection deliberately omits local paths; the
+    # ordinary worker context retains them for the local file-tool backend.
     attachments = list_attachments(conn, task_id)
     if attachments:
         lines.append("## Attachments")
-        lines.append(
-            "Files attached to this task. Read them with the file/terminal "
-            "tools at the absolute paths below:"
-        )
+        if include_paths:
+            lines.append(
+                "Files attached to this task. Read them with the file/terminal "
+                "tools at the absolute paths below:"
+            )
+        else:
+            lines.append("Files attached to this task; paths are withheld by the writer boundary:")
         for att in attachments:
             size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
             size_str = f", {size_kb} KB" if size_kb else ""
             ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+            if include_paths:
+                lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+            else:
+                lines.append(f"- `{att.filename}`{ctype}{size_str}")
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the
@@ -9623,6 +10311,9 @@ def add_notify_sub(
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
@@ -9694,6 +10385,13 @@ def add_notify_sub(
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
                 """,
                 (metadata_json, task_id, platform, chat_id, thread_id or ""),
+            )
+        if request_key is not None:
+            _append_event(
+                conn, task_id, "notify_subscribed",
+                {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": True},
             )
 
 
@@ -9840,6 +10538,9 @@ def remove_notify_sub(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     with write_txn(conn):
         cur = conn.execute(
@@ -9847,6 +10548,13 @@ def remove_notify_sub(
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id or ""),
         )
+        if request_key is not None:
+            _append_event(
+                conn, task_id, "notify_unsubscribed",
+                {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": cur.rowcount > 0},
+            )
     return cur.rowcount > 0
 
 
@@ -9874,12 +10582,18 @@ def unseen_events_for_sub(
         return 0, []
     cursor = int(row["last_event_id"])
     kind_list = list(kinds) if kinds else None
+    internal_kinds = (
+        "notify_subscribed", "notify_unsubscribed", "notify_claimed",
+        "notify_advanced", "notify_rewound",
+    )
     q = (
         "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind NOT IN (" + ",".join("?" * len(internal_kinds)) + ") "
         + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
         + "ORDER BY id ASC"
     )
     params: list[Any] = [task_id, cursor]
+    params.extend(internal_kinds)
     if kind_list:
         params.extend(kind_list)
     rows = conn.execute(q, params).fetchall()
@@ -9890,10 +10604,21 @@ def unseen_events_for_sub(
             payload = json.loads(r["payload"]) if r["payload"] else None
         except Exception:
             payload = None
+        try:
+            request_result = (
+                json.loads(r["request_result"])
+                if "request_result" in r.keys() and r["request_result"]
+                else None
+            )
+        except Exception:
+            request_result = None
         out.append(Event(
             id=r["id"], task_id=r["task_id"], kind=r["kind"],
             payload=payload, created_at=r["created_at"],
             run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+            request_key=(r["request_key"] if "request_key" in r.keys() else None),
+            request_digest=(r["request_digest"] if "request_digest" in r.keys() else None),
+            request_result=request_result,
         ))
         max_id = max(max_id, int(r["id"]))
     return max_id, out
@@ -9907,6 +10632,9 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -9922,6 +10650,22 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
+    def event_projection(events: Iterable[Event]) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": event.id,
+                "task_id": event.task_id,
+                "kind": event.kind,
+                "payload": event.payload,
+                "created_at": event.created_at,
+                "run_id": event.run_id,
+                "request_key": event.request_key,
+                "request_digest": event.request_digest,
+                "request_result": event.request_result,
+            }
+            for event in events
+        ]
+
     with write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
@@ -9929,6 +10673,15 @@ def claim_unseen_events_for_sub(
             (task_id, platform, chat_id, thread_id or ""),
         ).fetchone()
         if row is None:
+            if request_key is not None:
+                _append_event(
+                    conn, task_id, "notify_claimed",
+                    {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""},
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {
+                        "old_cursor": 0, "new_cursor": 0, "events": [],
+                    },
+                )
             return 0, 0, []
         old_cursor = int(row["last_event_id"])
         new_cursor, events = unseen_events_for_sub(
@@ -9940,6 +10693,16 @@ def claim_unseen_events_for_sub(
             kinds=kinds,
         )
         if not events:
+            if request_key is not None:
+                _append_event(
+                    conn, task_id, "notify_claimed",
+                    {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""},
+                    request_key=request_key, request_digest=request_digest,
+                    request_result=request_result or {
+                        "old_cursor": old_cursor, "new_cursor": old_cursor,
+                        "events": [],
+                    },
+                )
             return old_cursor, old_cursor, []
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
@@ -9947,6 +10710,16 @@ def claim_unseen_events_for_sub(
             "AND last_event_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
         )
+        if request_key is not None:
+            _append_event(
+                conn, task_id, "notify_claimed",
+                {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {
+                    "old_cursor": old_cursor, "new_cursor": new_cursor,
+                    "events": event_projection(events),
+                },
+            )
         return old_cursor, new_cursor, events
 
 
@@ -9958,6 +10731,9 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> None:
     with write_txn(conn):
         conn.execute(
@@ -9965,6 +10741,13 @@ def advance_notify_cursor(
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
+        if request_key is not None:
+            _append_event(
+                conn, task_id, "notify_advanced",
+                {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": True, "cursor": int(new_cursor)},
+            )
 
 
 def rewind_notify_cursor(
@@ -9976,6 +10759,9 @@ def rewind_notify_cursor(
     thread_id: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
+    request_key: Optional[str] = None,
+    request_digest: Optional[str] = None,
+    request_result: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
@@ -9993,6 +10779,13 @@ def rewind_notify_cursor(
                 int(claimed_cursor),
             ),
         )
+        if request_key is not None:
+            _append_event(
+                conn, task_id, "notify_rewound",
+                {"platform": platform, "chat_id": chat_id, "thread_id": thread_id or ""},
+                request_key=request_key, request_digest=request_digest,
+                request_result=request_result or {"ok": cur.rowcount > 0},
+            )
     return cur.rowcount > 0
 
 

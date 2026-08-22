@@ -281,6 +281,10 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
+    return DecomposeOutcome(
+        task_id, False,
+        "decompose refused: triage graph creation is not an admitted writer operation",
+    )
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
@@ -458,6 +462,9 @@ def decompose_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
+    raise RuntimeError(
+        "triage listing refused: use the admitted writer list operation"
+    )
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,

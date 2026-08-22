@@ -625,6 +625,16 @@ _NON_GATEWAY_SOURCES = frozenset({
 })
 
 
+_D0B_NO_RID = object()
+
+
+def _d0b_tui_refused(route: str, rid: Any = _D0B_NO_RID) -> dict | None:
+    """Fail closed before legacy TUI session/persistence effects."""
+    if rid is _D0B_NO_RID:
+        return None
+    return _err(rid, -3201, f"{route} refused by the D0B admission boundary")
+
+
 def _is_gateway_owned_source(source: str) -> bool:
     """True when ``source`` names a messaging-gateway platform whose session
     lifecycle belongs to the gateway, not to this TUI backend.
@@ -658,6 +668,8 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     force-quit (double Ctrl‑C, terminal‑close, SIGHUP) while the agent
     is mid‑turn.
     """
+    return _d0b_tui_refused("_finalize_session")
+
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
@@ -1296,6 +1308,8 @@ _start_idle_reaper()
 
 
 def _get_db():
+    return _d0b_tui_refused("_get_db")
+
     global _db, _db_error
     if _db is None:
         from hermes_state import SessionDB
@@ -1323,6 +1337,8 @@ def _db_for_profile(profile: str | None = None):
 
     Returns (db, owns_handle). ``db`` is None when unavailable.
     """
+    return _d0b_tui_refused("_db_for_profile") or (None, False)
+
     profile_home = _profile_home(profile)
     if profile_home is None:
         return _get_db(), False
@@ -1346,6 +1362,8 @@ def _profile_db(params: dict | None = None):
     Closes dedicated profile handles; leaves the launch-profile shared handle open.
     Yields None when the db is unavailable.
     """
+    return _d0b_tui_refused("_profile_db")
+
     profile = None
     if isinstance(params, dict):
         profile = (params.get("profile") or "").strip() or None
@@ -1886,6 +1904,10 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
 
 
 def handle_request(req: dict) -> dict | None:
+    return _d0b_tui_refused(
+        "handle_request", req.get("id") if isinstance(req, dict) else None
+    )
+
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
         return normalized
@@ -1909,6 +1931,10 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     Omitting it falls back to the module-level stdio transport, preserving
     the original behaviour for ``tui_gateway.entry``.
     """
+    return _d0b_tui_refused(
+        "dispatch", req.get("id") if isinstance(req, dict) else None
+    )
+
     t = transport or _stdio_transport
     token = bind_transport(t)
     try:
@@ -2270,11 +2296,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 
 def _sess_nowait(params, rid):
+    return None, _d0b_tui_refused("_sess_nowait", rid)
+
     s = _sessions.get(params.get("session_id") or "")
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
 
 
 def _sess(params, rid):
+    return None, _d0b_tui_refused("_sess", rid)
+
     s, err = _sess_nowait(params, rid)
     if err:
         return (None, err)
@@ -2583,6 +2613,8 @@ def _session_source(session: dict | None) -> str:
 
 
 def _register_session_cwd(session: dict | None) -> None:
+    return _d0b_tui_refused("_register_session_cwd")
+
     if not session:
         return
     try:
@@ -2617,6 +2649,8 @@ def _ensure_session_db_row(session: dict) -> None:
       the session with no cwd AND no git_repo_root, so the sidebar could never
       place it under its project.
     """
+    return _d0b_tui_refused("_ensure_session_db_row")
+
     key = session.get("session_key")
     if not key:
         return
@@ -2736,6 +2770,8 @@ def _persist_branch_seed(session: dict) -> None:
     branch row would resume missing its pre-branch context. Runs once; the row +
     parent link are written by ``_ensure_session_db_row`` just before this.
     """
+    return _d0b_tui_refused("_persist_branch_seed")
+
     if not session.get("parent_session_id") or session.get("_branch_seed_persisted"):
         return
     key = session.get("session_key")
@@ -2787,6 +2823,8 @@ def _session_db(session: dict):
     everything else borrows the shared ``_get_db()`` handle (left open). Yields
     None when the db is unavailable.
     """
+    return _d0b_tui_refused("_session_db")
+
     db, close_db = None, False
     profile_home = session.get("profile_home")
     if profile_home:
@@ -2819,6 +2857,8 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
     falls back to its live resolver / lazy backfill). Daemon, so a mid-flight
     probe never delays gateway shutdown.
     """
+    return _d0b_tui_refused("_persist_session_git_meta")
+
     session_key = session.get("session_key", "")
     if not session_key or not cwd:
         return
@@ -2842,6 +2882,8 @@ def _persist_session_git_meta(session: dict, cwd: str) -> None:
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
+    return _d0b_tui_refused("_set_session_cwd")
+
     from hermes_constants import translate_cwd_for_wsl_backend
 
     cwd = translate_cwd_for_wsl_backend(str(cwd))
@@ -3743,6 +3785,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
 
 def _persist_live_session_runtime(session: dict | None) -> None:
     """Persist active session runtime so future resumes restore the same footer."""
+    return _d0b_tui_refused("_persist_live_session_runtime")
+
     if not session:
         return
     agent = session.get("agent")
@@ -3782,6 +3826,8 @@ def _persist_live_session_runtime(session: dict | None) -> None:
 
 def _persist_live_session_system_prompt(session: dict | None) -> None:
     """Refresh the stored system prompt after a live runtime identity change."""
+    return _d0b_tui_refused("_persist_live_session_system_prompt")
+
     if not session:
         return
     agent = session.get("agent")
@@ -3826,6 +3872,8 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
     re-sent each turn; the dedup is self-healing across resumes because the
     next switch collapses whatever markers a reload brought back.
     """
+    return _d0b_tui_refused("_append_model_switch_marker")
+
     if not session:
         return
     session_key = str(session.get("session_key") or "").strip()
@@ -4253,6 +4301,8 @@ def _restart_slash_worker(sid: str, session: dict):
 
 
 def _persist_model_switch(result) -> None:
+    return _d0b_tui_refused("_persist_model_switch")
+
     # Use targeted, atomic key writes (comment/ordering-preserving) instead of
     # rewriting the whole `model:` block. A full-block rewrite via save_config()
     # destroys sibling keys the user set under `model:` — `model_slots`,
@@ -4767,6 +4817,8 @@ def _sync_session_key_after_compress(
             auto-compression (worker holds stale session key). False only
             if the caller manages the worker lifecycle separately.
     """
+    return _d0b_tui_refused("_sync_session_key_after_compress")
+
     agent = session.get("agent")
     new_session_id = getattr(agent, "session_id", None) or ""
     old_key = session.get("session_key", "") or ""
@@ -6474,6 +6526,8 @@ def _init_session(
     source: str | None = None,
     profile_home: str | None = None,
 ):
+    return _d0b_tui_refused("_init_session")
+
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
@@ -8875,112 +8929,8 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
 
 
 def _collect_kanban_notifications(session: dict) -> list:
-    """Claim unseen terminal kanban events for this TUI session's subscriptions.
-
-    ``kanban_create`` auto-subscribes TUI/desktop sessions with
-    ``platform="tui"`` and ``chat_id=HERMES_SESSION_KEY`` (see
-    tools/kanban_tools.py ``_maybe_auto_subscribe``). The gateway notifier
-    can't deliver those — there is no "tui" messaging adapter — so this
-    poller is the delivery path for them (issue #59890). Uses the same
-    atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
-
-    Returns the list of formatted notification texts (may be empty).
-    """
-    session_key = str(session.get("session_key") or "")
-    if not session_key or session.get("_finalized"):
-        return []
-    try:
-        from hermes_cli import kanban_db as _kb
-    except Exception:
-        return []
-    texts: list = []
-    try:
-        boards = _kb.list_boards(include_archived=False)
-    except Exception:
-        try:
-            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-        except Exception:
-            return []
-    # Poll each resolved DB path once — multiple slugs can point at the same
-    # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
-    # notifier).
-    seen_db_paths: set = set()
-    for board_meta in boards:
-        slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
-        db_path = (board_meta or {}).get("db_path")
-        try:
-            resolved = (
-                str(Path(db_path).expanduser().resolve())
-                if db_path else str(_kb.kanban_db_path(slug).resolve())
-            )
-        except Exception:
-            resolved = f"slug:{slug}"
-        if resolved in seen_db_paths:
-            continue
-        seen_db_paths.add(resolved)
-        # A poller runs per live TUI/Desktop session. Avoid opening this board
-        # writable unless it has a subscription owned by this exact session;
-        # subscriptions for gateways or other sessions are not actionable here.
-        try:
-            if _kb.count_notify_subs(
-                board=slug,
-                platform="tui",
-                chat_id=session_key,
-            ) == 0:
-                continue
-        except Exception:
-            # Preserve delivery if the read-only probe cannot inspect a
-            # locked, corrupt, or otherwise unusual database.
-            pass
-        try:
-            conn = _kb.connect(board=slug)
-        except Exception:
-            continue
-        try:
-            try:
-                subs = _kb.list_notify_subs(conn)
-            except Exception:
-                continue
-            for sub in subs:
-                if (sub.get("platform") or "").lower() != "tui":
-                    continue
-                if sub.get("chat_id") != session_key:
-                    continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
-                )
-                if not events:
-                    continue
-                task = _kb.get_task(conn, sub["task_id"])
-                for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
-                    if text:
-                        texts.append(text)
-                # Unsubscribe only at a truly final status (done/archived);
-                # blocked/crashed subs stay live so a respawned task's next
-                # terminal event still reaches the user (same rule as the
-                # gateway notifier).
-                if task and getattr(task, "status", "") in {"done", "archived"}:
-                    try:
-                        _kb.remove_notify_sub(
-                            conn,
-                            task_id=sub["task_id"],
-                            platform=sub["platform"],
-                            chat_id=sub["chat_id"],
-                            thread_id=sub.get("thread_id") or "",
-                        )
-                    except Exception:
-                        pass
-        finally:
-            conn.close()
-    return texts
+    """Refuse TUI subscription enumeration until a writer read adapter exists."""
+    return _d0b_tui_refused("_collect_kanban_notifications") or []
 
 
 def _notification_poller_loop(

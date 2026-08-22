@@ -2448,14 +2448,9 @@ def _pin_kanban_board_env() -> None:
     calls hit board B (#20074). Pinning at chat boot mirrors what the
     dispatcher already does for spawned workers.
     """
-    if os.environ.get("HERMES_KANBAN_BOARD"):
-        return
-    try:
-        from hermes_cli.kanban_db import get_current_board
-
-        os.environ["HERMES_KANBAN_BOARD"] = get_current_board()
-    except Exception:
-        pass
+    # Board identity is writer-owned.  Chat startup must not select or pin a
+    # board in the caller environment.
+    return
 
 
 def _sync_bundled_skills_quietly() -> None:

@@ -3843,16 +3843,16 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
     if isinstance(message, str):
         dropped = _detect_file_drop(message)
         if dropped and dropped.get("is_image"):
-            images.append(dropped["path"])
-            message = dropped["remainder"] or f"[User attached image: {dropped['path'].name}]"
+            raise ValueError(
+                "image collection refused: inline image bytes are required; "
+                "local file attachments are not admitted on this route"
+            )
 
     if image_arg:
-        explicit_path = _resolve_attachment_path(image_arg)
-        if explicit_path is None:
-            raise ValueError(f"Image file not found: {image_arg}")
-        if explicit_path.suffix.lower() not in _IMAGE_EXTENSIONS:
-            raise ValueError(f"Not a supported image file: {explicit_path}")
-        images.append(explicit_path)
+        raise ValueError(
+            "image collection refused: inline image bytes are required; "
+            "local file attachments are not admitted on this route"
+        )
 
     deduped: list[Path] = []
     seen: set[str] = set()
@@ -7397,7 +7397,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Saves the image to ~/.hermes/images/ and appends the path to
         ``_attached_images``.  Returns True if an image was attached.
         """
-        from hermes_cli.clipboard import save_clipboard_image
+        # Clipboard capture writes a local artifact; the admitted route only
+        # accepts bounded inline bytes through the privileged writer.
+        return False
 
         img_dir = get_hermes_home() / "images"
         self._image_counter += 1
@@ -17859,6 +17861,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _kanban_d0b_refused(route: str) -> None:
+    """Return the legacy Kanban goal path's explicit D0B refusal."""
+    return None
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -17869,6 +17876,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     caller — a broken goal loop must never wedge a worker, the dispatcher's
     claim TTL / crash detection is the backstop.
     """
+    # Goal-loop orchestration is not an admitted writer operation. Lifecycle
+    # completion must be requested through the fixed writer IPC route.
+    return _kanban_d0b_refused("_run_kanban_goal_loop_q")
+
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
@@ -17917,6 +17928,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return resp or ""
 
     def _task_status() -> "str | None":
+        return _kanban_d0b_refused("_task_status")
+
         c = _kb.connect()
         try:
             t = _kb.get_task(c, task_id)
@@ -17928,6 +17941,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 pass
 
     def _block(reason: str) -> None:
+        return _kanban_d0b_refused("_block")
+
         c = _kb.connect()
         try:
             _kb.block_task(c, task_id, reason=reason)
@@ -18262,33 +18277,10 @@ def main(
             single_query_image_urls: list[str] = []
             _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
             if _kanban_task_id:
-                try:
-                    from hermes_cli import kanban_db as _kb
-                    from agent.image_routing import extract_image_refs as _extract_refs
-
-                    _conn = _kb.connect()
-                    try:
-                        _task = _kb.get_task(_conn, _kanban_task_id)
-                    finally:
-                        try:
-                            _conn.close()
-                        except Exception:
-                            pass
-                    _body = getattr(_task, "body", "") if _task is not None else ""
-                    if _body:
-                        _kb_paths, _kb_urls = _extract_refs(_body)
-                        if _kb_paths:
-                            # Dedupe against any --image the user already passed.
-                            _seen = {str(p) for p in single_query_images}
-                            for _p in _kb_paths:
-                                if _p not in _seen:
-                                    _seen.add(_p)
-                                    single_query_images.append(Path(_p))
-                        if _kb_urls:
-                            single_query_image_urls.extend(_kb_urls)
-                except Exception as _exc:
-                    # Best-effort enrichment; never block worker startup on it.
-                    logger.debug("kanban image-ref extraction failed: %s", _exc)
+                logger.debug(
+                    "kanban task image collection refused: only inline bytes "
+                    "are admitted by the privileged writer"
+                )
             if quiet:
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.

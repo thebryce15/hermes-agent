@@ -97,6 +97,9 @@ def create_swarm(
     ``done`` with topology metadata, parallel workers are ``ready``, the verifier
     waits for every worker, and the synthesizer waits for the verifier.
     """
+    raise RuntimeError(
+        "kanban swarm refused: swarm graph creation is not an admitted writer operation"
+    )
 
     goal = _require_text(goal, "goal")
     verifier_assignee = _require_text(verifier_assignee, "verifier_assignee")
@@ -231,6 +234,10 @@ def post_blackboard_update(
     value: Any,
 ) -> int:
     """Append one structured update to the swarm root blackboard."""
+
+    raise RuntimeError(
+        "kanban swarm refused: blackboard updates are not an admitted writer operation"
+    )
 
     _require_text(root_id, "root_id")
     author = _require_text(author, "author")

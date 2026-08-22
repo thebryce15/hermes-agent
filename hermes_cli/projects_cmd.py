@@ -19,6 +19,16 @@ import sys
 from hermes_cli import projects_db as pdb
 
 
+def _d0b_project_refused(route: str) -> int:
+    """Fail closed before any project, path, or board store access."""
+    print(
+        f"project {route} refused: project/path/board routes are not admitted "
+        "by the privileged Kanban writer",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def build_parser(
     parent_subparsers: argparse._SubParsersAction,
 ) -> argparse.ArgumentParser:
@@ -120,6 +130,8 @@ def projects_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    return _d0b_project_refused(action)
+
     handlers = {
         "create": _cmd_create,
         "list": _cmd_list,
@@ -157,6 +169,8 @@ def _with_project(fn):
 
     @functools.wraps(fn)
     def wrapper(args: argparse.Namespace) -> int:
+        return _d0b_project_refused(getattr(args, "project_action", "project"))
+
         with pdb.connect_closing() as conn:
             proj = _resolve(conn, args.project)
             if proj is None:
@@ -189,6 +203,8 @@ def _print_project(proj) -> None:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    return _d0b_project_refused("create")
+
     try:
         with pdb.connect_closing() as conn:
             pid = pdb.create_project(
@@ -217,6 +233,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
+    return _d0b_project_refused("list")
+
     with pdb.connect_closing() as conn:
         active = pdb.get_active_id(conn)
         projs = pdb.list_projects(
@@ -235,12 +253,16 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 @_with_project
 def _cmd_show(args, conn, proj) -> int:
+    return _d0b_project_refused("show")
+
     _print_project(proj)
     return 0
 
 
 @_with_project
 def _cmd_add_folder(args, conn, proj) -> int:
+    return _d0b_project_refused("add-folder")
+
     path = pdb.add_folder(conn, proj.id, args.path, label=args.label, is_primary=args.primary)
     print(f"Added {path} to {proj.slug}")
     return 0
@@ -248,6 +270,8 @@ def _cmd_add_folder(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_remove_folder(args, conn, proj) -> int:
+    return _d0b_project_refused("remove-folder")
+
     if not pdb.remove_folder(conn, proj.id, args.path):
         print(f"project: folder not in project: {args.path}", file=sys.stderr)
         return 1
@@ -257,6 +281,8 @@ def _cmd_remove_folder(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_rename(args, conn, proj) -> int:
+    return _d0b_project_refused("rename")
+
     pdb.update_project(conn, proj.id, name=args.name)
     print(f"Renamed {proj.slug} -> {args.name}")
     return 0
@@ -264,6 +290,8 @@ def _cmd_rename(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_set_primary(args, conn, proj) -> int:
+    return _d0b_project_refused("set-primary")
+
     if not pdb.set_primary(conn, proj.id, args.path):
         print(
             f"project: '{args.path}' is not a folder of {proj.slug}; "
@@ -276,6 +304,8 @@ def _cmd_set_primary(args, conn, proj) -> int:
 
 
 def _cmd_use(args: argparse.Namespace) -> int:
+    return _d0b_project_refused("use")
+
     with pdb.connect_closing() as conn:
         if not args.project:
             pdb.set_active(conn, None)
@@ -291,6 +321,8 @@ def _cmd_use(args: argparse.Namespace) -> int:
 
 @_with_project
 def _cmd_archive(args, conn, proj) -> int:
+    return _d0b_project_refused("archive")
+
     pdb.archive_project(conn, proj.id)
     print(f"Archived {proj.slug}")
     return 0
@@ -298,6 +330,8 @@ def _cmd_archive(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_restore(args, conn, proj) -> int:
+    return _d0b_project_refused("restore")
+
     pdb.restore_project(conn, proj.id)
     print(f"Restored {proj.slug}")
     return 0
@@ -305,6 +339,8 @@ def _cmd_restore(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_bind_board(args, conn, proj) -> int:
+    return _d0b_project_refused("bind-board")
+
     pdb.update_project(conn, proj.id, board_slug=args.board)
     if args.board.strip():
         print(f"Bound {proj.slug} -> board {args.board}")
@@ -320,6 +356,8 @@ def _sync_board_default_workdir(proj, board_slug: str) -> None:
     Keeps kanban task worktrees anchored to the project's repo. Failures here
     are non-fatal — the binding itself already succeeded.
     """
+    return _d0b_project_refused("sync-board-default-workdir")
+
     if not proj.primary_path:
         return
     try:
