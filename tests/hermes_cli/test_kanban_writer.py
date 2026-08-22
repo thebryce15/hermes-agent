@@ -355,6 +355,9 @@ def test_create_replay_refuses_legacy_idempotency_row_without_marker(tmp_path):
 @pytest.mark.skipif(os.name != "posix", reason="the writer is AF_UNIX-only")
 def test_writer_rejects_open_shapes_and_completion_paths(tmp_path):
     writer = KanbanWriter(_config(tmp_path))
+    task_id = writer.dispatch(
+        _frame("create", {"title": "shape validation"}, "shape-task"), _peer()
+    )["result"]["task_id"]
 
     with pytest.raises(WriterProtocolError, match="unknown comment field"):
         writer.dispatch(
@@ -366,7 +369,7 @@ def test_writer_rejects_open_shapes_and_completion_paths(tmp_path):
         writer.dispatch(
             _frame(
                 "complete",
-                {"task_id": "t_1", "metadata": {"nested": {"x": 1}}},
+                {"task_id": task_id, "metadata": {"nested": {"x": 1}}},
                 "r2",
             ),
             _peer(),
@@ -376,7 +379,7 @@ def test_writer_rejects_open_shapes_and_completion_paths(tmp_path):
         writer.dispatch(
             _frame(
                 "complete",
-                {"task_id": "t_1", "metadata": {"output": "relative/file.txt"}},
+                {"task_id": task_id, "metadata": {"output": "relative/file.txt"}},
                 "r3",
             ),
             _peer(),
@@ -445,7 +448,7 @@ def test_writer_attachment_does_not_follow_dangling_symlink(tmp_path):
         "data_b64": base64.b64encode(b"safe").decode("ascii"),
     }
 
-    with pytest.raises(kb.AttachmentConflict, match="reconcile"):
+    with pytest.raises(kb.AttachmentConflict, match="symlink"):
         writer.dispatch(_frame("attach", args, "attach-symlink"), _peer())
 
     assert not target.exists()
