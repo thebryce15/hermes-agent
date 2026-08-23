@@ -103,6 +103,89 @@ def test_public_writer_request_refuses_mutation_without_idempotency_key(monkeypa
         writer_request(operation="create", args={"title": "missing key"})
 
 
+def test_fixture_authority_receives_top_level_request_key_after_frame_validation(tmp_path):
+    calls = []
+
+    def authorize(uid, operation, request, request_key, peer_pid):
+        calls.append((uid, operation, request, request_key, peer_pid))
+        return {
+            "authorized": True,
+            "authorized_for_fixture": True,
+            "live_production_enabled": False,
+            "profile": "worker",
+            "operation": operation,
+            "canonical_board": str(CANONICAL_DB_PATH),
+        }
+
+    config = WriterConfig.for_fixture(
+        db_path=tmp_path / "kanban.db",
+        socket_path=tmp_path / "writer.sock",
+        attachments_root=tmp_path / "attachments",
+        peer_profile=lambda uid: "worker" if uid == 1000 else None,
+        policy=lambda _profile, _operation: True,
+        authority=authorize,
+    )
+    writer = KanbanWriter(config)
+    raw = _frame("create", {"title": "exact key"}, "authority-key")
+
+    writer.dispatch(raw, _peer())
+    assert calls == [(1000, "create", {"title": "exact key"}, "authority-key", 321)]
+
+    with pytest.raises(WriterProtocolError, match="mutations require request_key"):
+        writer.dispatch({"operation": "create", "args": {"title": "missing"}}, _peer())
+    with pytest.raises(WriterProtocolError, match="request_key must be"):
+        writer.dispatch(
+            {"operation": "create", "args": {"title": "raw"}, "request_key": "raw key"},
+            _peer(),
+        )
+    assert len(calls) == 1
+
+
+def test_bound_authority_without_peer_pid_parameter_fails_closed_before_db(tmp_path):
+    def legacy_authorize(_uid, _operation, _request, _request_key):
+        return {
+            "authorized": True,
+            "authorized_for_fixture": True,
+            "live_production_enabled": False,
+            "profile": "worker",
+            "operation": "show",
+            "canonical_board": str(CANONICAL_DB_PATH),
+        }
+
+    writer = KanbanWriter(
+        WriterConfig.for_fixture(
+            db_path=tmp_path / "kanban.db",
+            socket_path=tmp_path / "writer.sock",
+            attachments_root=tmp_path / "attachments",
+            peer_profile=lambda uid: "worker" if uid == 1000 else None,
+            policy=lambda _profile, _operation: True,
+            authority=legacy_authorize,
+        )
+    )
+    with pytest.raises(WriterAuthorizationError, match="Spark writer authority refused"):
+        writer.dispatch(_frame("create", {"title": "must refuse"}, "authority-key"), _peer())
+    assert not (tmp_path / "kanban.db").exists()
+
+
+def test_bound_authority_with_malformed_decision_fails_closed_before_db(tmp_path):
+    def malformed_authorize(_uid, _operation, _request, _request_key, _peer_pid):
+        return {"authorized": True}
+
+    writer = KanbanWriter(
+        WriterConfig.for_fixture(
+            db_path=tmp_path / "kanban.db",
+            socket_path=tmp_path / "writer.sock",
+            attachments_root=tmp_path / "attachments",
+            peer_profile=lambda uid: "worker" if uid == 1000 else None,
+            policy=lambda _profile, _operation: True,
+            authority=malformed_authorize,
+        )
+    )
+    with pytest.raises(WriterAuthorizationError, match="Spark writer authority refused"):
+        writer.dispatch(_frame("create", {"title": "must refuse"}, "authority-key"), _peer())
+    assert not (tmp_path / "kanban.db").exists()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="the writer is AF_UNIX-only")
 def test_production_config_freezes_canonical_targets_and_fixture_is_explicit(tmp_path):
     with pytest.raises(WriterProtocolError, match=r"production\(\)|for_fixture"):
@@ -596,7 +679,9 @@ def test_production_writer_binds_spark_authority_callback_without_policy_copy():
         def peer_profile(self, uid):
             return "worker" if uid == 61001 else None
 
-        def authorize(self, uid, operation, request):
+        def authorize(self, uid, operation, request, request_key, peer_pid):
+            assert request_key == "show-key"
+            assert peer_pid == 1
             if uid != 61001 or operation != "show":
                 raise ValueError("refused")
             return {
@@ -610,7 +695,7 @@ def test_production_writer_binds_spark_authority_callback_without_policy_copy():
 
     writer = KanbanWriter(WriterConfig.from_spark_adapter(SparkFixture()))
     peer = writer.peer_from_credentials((1, 61001, 61002))
-    writer._authorize(peer, "show", {"task_id": "t_fixture"})
+    writer._authorize(peer, "show", {"task_id": "t_fixture"}, "show-key")
     with pytest.raises(WriterAuthorizationError):
         writer.peer_from_credentials((1, 61999, 61999))
 

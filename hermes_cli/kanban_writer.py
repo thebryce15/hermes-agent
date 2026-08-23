@@ -137,7 +137,9 @@ class Peer:
 
 PeerProfile = Callable[[int], Optional[str]]
 PolicyCallback = Callable[[str, str], bool]
-AuthorityCallback = Callable[[int, str, Mapping[str, Any]], Mapping[str, Any]]
+AuthorityCallback = Callable[
+    [int, str, Mapping[str, Any], Optional[str], int], Mapping[str, Any]
+]
 
 
 def _deny_peer(_uid: int) -> Optional[str]:
@@ -489,7 +491,7 @@ class KanbanWriter:
 
     def dispatch(self, raw: Mapping[str, Any], peer: Peer) -> dict[str, Any]:
         operation, args, request_key, request_digest = _validate_request(raw)
-        self._authorize(peer, operation, args)
+        self._authorize(peer, operation, args, request_key)
         try:
             if self.config._fixture:
                 conn = kb.connect(db_path=self.config.db_path)
@@ -547,7 +549,11 @@ class KanbanWriter:
             conn.close()
 
     def _authorize(
-        self, peer: Peer, operation: str, args: Mapping[str, Any],
+        self,
+        peer: Peer,
+        operation: str,
+        args: Mapping[str, Any],
+        request_key: Optional[str],
     ) -> None:
         """Authorize from Spark when explicitly bound, otherwise use deny-all/policy."""
         if self.config.authority is None:
@@ -557,7 +563,9 @@ class KanbanWriter:
                 )
             return
         try:
-            decision = self.config.authority(peer.uid, operation, dict(args))
+            decision = self.config.authority(
+                peer.uid, operation, dict(args), request_key, peer.pid,
+            )
         except Exception as exc:  # authority callback is a trust boundary
             raise WriterAuthorizationError("Spark writer authority refused request") from exc
         if not isinstance(decision, Mapping):
